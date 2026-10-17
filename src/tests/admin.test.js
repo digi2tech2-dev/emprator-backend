@@ -365,6 +365,21 @@ describe('[3] Admin Settings Service', () => {
         expect(fresh.value).toBe(true);
     });
 
+    it('creates a missing paymentGroups setting when an admin saves it', async () => {
+        const { admin } = await setup();
+        await Setting.deleteOne({ key: 'paymentGroups' });
+        const paymentGroups = [{
+            id: 'wallets',
+            name: 'Wallets',
+            methods: [{ id: 'wallet-1', name: 'Wallet 1', feePercent: 0 }],
+        }];
+
+        const saved = await adminSettingService.updateSetting('paymentGroups', paymentGroups, admin._id);
+        expect(saved.value).toEqual(paymentGroups);
+        expect(saved.updatedBy.toString()).toBe(admin._id.toString());
+        expect((await Setting.find({ key: 'paymentGroups' })).length).toBe(1);
+    });
+
     it('updateSetting invalidates cached payment settings', async () => {
         const { admin } = await setup();
         const cached = await adminSettingService.getPaymentSettings();

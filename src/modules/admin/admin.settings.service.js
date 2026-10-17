@@ -7,7 +7,7 @@
  * Only admins can write. Reads can be used internally.
  */
 
-const { Setting } = require('./setting.model');
+const { Setting, DEFAULT_SETTINGS } = require('./setting.model');
 const { NotFoundError } = require('../../shared/errors/AppError');
 const { createAuditLog } = require('../audit/audit.service');
 const { ADMIN_ACTIONS, ENTITY_TYPES, ACTOR_ROLES } = require('../audit/audit.constants');
@@ -87,21 +87,31 @@ const invalidateSettingsCache = (key) => {
 
 const updateSetting = async (key, value, adminId) => {
     let setting = await Setting.findOne({ key });
-    if (!setting) throw new NotFoundError('Setting');
+    // A payment setting can be absent when the startup seed has not completed.
+    // An authenticated admin update should still be able to create that known key.
+    if (!setting && !PAYMENT_SETTING_KEYS.has(key)) throw new NotFoundError('Setting');
 
-    const before = setting.value;
+    const before = setting?.value;
 
     if (key === 'paymentGroups') {
         validatePaymentGroupsFeePercent(value);
         validatePaymentGroupsQrCodeImages(value);
     }
 
-    // Mongoose does not detect mutations to Mixed-type fields.
-    // Without markModified(), `.save()` silently skips the write.
-    setting.value = value;
-    setting.updatedBy = adminId;
-    setting.markModified('value');
-    await setting.save();
+    if (setting) {
+        // Mongoose does not detect mutations to Mixed-type fields.
+        setting.value = value;
+        setting.updatedBy = adminId;
+        setting.markModified('value');
+        await setting.save();
+    } else {
+        const description = DEFAULT_SETTINGS.find((item) => item.key === key)?.description || '';
+        setting = await Setting.findOneAndUpdate(
+            { key },
+            { $set: { value, updatedBy: adminId }, $setOnInsert: { description } },
+            { upsert: true, new: true, runValidators: true }
+        );
+    }
 
     invalidateSettingsCache(key);
 
