@@ -734,7 +734,7 @@ pm2 restart digital-platform-api
 pm2 stop digital-platform-api
 ```
 
-Important PM2 detail: the config uses `instances: 'max'` and `exec_mode: 'cluster'`. The app's cron locks and WhatsApp state are process-local only. Running multiple workers can duplicate provider syncs, duplicate fulfillment polling, and start multiple WhatsApp clients. For production, run jobs/WhatsApp in a single worker or move them to a separate process.
+Important PM2 detail: the config intentionally uses one `fork` worker. The app's cron locks and WhatsApp state are process-local; multiple workers could duplicate provider syncs, fulfillment polling, and WhatsApp clients.
 
 Production checklist:
 
@@ -752,6 +752,7 @@ Production checklist:
 - Keep `app.set('trust proxy', 1)` in mind when deploying behind more complex proxy chains.
 - Monitor process logs and PM2 logs under `logs/`.
 - Use `/health` for health checks.
+- Before starting the production process, run `npm run verify:production`; it rejects missing secrets, local database URLs, local frontend URLs, unsafe CORS values, and local-safe mode.
 
 Docker configuration is not present in this repository.
 

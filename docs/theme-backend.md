@@ -47,6 +47,10 @@ Uploaded images use the application's existing local `uploads` directory. Produc
 
 The older per-user `/api/subscriptions/*` and theme mutation routes are not mounted. Platform administrators share the one platform theme and entitlement; ordinary users cannot reach editor or billing APIs.
 
+## Production deployment check
+
+Before deployment, run `npm run verify:production` with the server's production environment loaded. Then run `node scripts/ensure-theme-indexes.js` once against the production MongoDB replica set. After the backend is live, verify `GET /health` and `GET /api/theme/published`; the latter returns a successful response with `published: null` until the first platform theme is published. Build the frontend only after setting `VITE_DATA_PROVIDER=real` and `VITE_API_BASE_URL` to this backend's public `/api` URL. The backend `ALLOWED_ORIGINS` value must include the exact frontend origin.
+
 ## Temporary activation codes and neon effects
 
 After independent receipt verification, `confirm-theme-usdt.js` marks the payment verified and issues a random one-time 10-digit code unless an operator supplies one with `--code`. The operator sends the issued code privately to the paying administrator. It is stored as a salted hash, bound to that payer and payment, and expires after 48 hours. The admin editor finds the verified transfer automatically, so the payer enters only the code; only successful redemption creates the three-calendar-month subscription for a new order. The redeem endpoint is rate limited per administrator. A lost or expired unredeemed code can be replaced with `node scripts/reissue-theme-code.js --reference=THEME-... --reviewer=... --reissue-code`; the old code is invalidated. No code is created or sent before verified receipt, and no HTTP endpoint reveals a code. `PlatformThemeCodeUse` permanently records keyed fingerprints to prevent assigning a code twice; its unique index is prepared by the operator scripts and by `scripts/ensure-theme-indexes.js`.
