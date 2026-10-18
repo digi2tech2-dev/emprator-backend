@@ -8,7 +8,8 @@
  */
 
 const { Setting, DEFAULT_SETTINGS } = require('./setting.model');
-const { NotFoundError } = require('../../shared/errors/AppError');
+const { NotFoundError, ValidationError } = require('../../shared/errors/AppError');
+const themeService = require('../theme/theme.service');
 const { createAuditLog } = require('../audit/audit.service');
 const { ADMIN_ACTIONS, ENTITY_TYPES, ACTOR_ROLES } = require('../audit/audit.constants');
 const settingsCache = require('./settings.cache');
@@ -22,7 +23,29 @@ const PAYMENT_SETTING_KEYS = new Set([
     'paymentCountryAccounts',
     'paymentInstructions',
     'whatsappNumber',
+    'supportContacts',
+    'adminNotificationWhatsApp',
 ]);
+
+const normalizeSupportContacts = (value) => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new ValidationError('Invalid support contacts');
+    const clean = (number) => String(number || '').replace(/[^0-9+]/g, '').trim();
+    const owner = clean(value.owner);
+    const support = clean(value.support);
+    if (!/^\+?[0-9]{7,20}$/.test(owner) || !/^\+?[0-9]{7,20}$/.test(support)) {
+        throw new ValidationError('Invalid support contacts');
+    }
+    return { owner, support };
+};
+const normalizeInternationalWhatsApp = (value) => {
+    const input = String(value || '').trim().replace(/[٠-٩۰-۹]/g, (digit) => String(digit.charCodeAt(0) & 15));
+    if (!input) return '';
+    if (!/^\+?[\d\s()-]+$/.test(input)) throw new ValidationError('Enter a valid WhatsApp number with country code.');
+    let number = input.replace(/[^\d]/g, '');
+    if (number.startsWith('00')) number = number.slice(2);
+    if (!/^[1-9]\d{7,14}$/.test(number)) throw new ValidationError('Enter a valid WhatsApp number with country code, for example +201012345678.');
+    return number;
+};
 
 // ─── List ──────────────────────────────────────────────────────────────────────
 
@@ -67,6 +90,7 @@ const getPaymentSettings = async () => {
         countryAccounts: find('paymentCountryAccounts') || [],
         instructions: find('paymentInstructions') || '',
         whatsappNumber: find('whatsappNumber') || '',
+        supportContacts: find('supportContacts') || null,
     };
 
     return settingsCache.set(cacheKey, payload);
@@ -96,6 +120,13 @@ const updateSetting = async (key, value, adminId) => {
     if (key === 'paymentGroups') {
         validatePaymentGroupsFeePercent(value);
         validatePaymentGroupsQrCodeImages(value);
+    }
+    if (key === 'supportContacts' || key === 'adminNotificationWhatsApp') {
+        const status = await themeService.getStatus();
+        if (status.eligibility.plan !== 'THEME_ULTRA') {
+            throw new ValidationError('Changing WhatsApp contact or notification numbers requires Theme Customization Ultra.');
+        }
+        value = key === 'supportContacts' ? normalizeSupportContacts(value) : normalizeInternationalWhatsApp(value);
     }
 
     if (setting) {

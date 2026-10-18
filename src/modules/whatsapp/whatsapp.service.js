@@ -4,6 +4,7 @@ const fs = require('fs/promises');
 const path = require('path');
 const qrcode = require('qrcode');
 const config = require('../../config/config');
+const { Setting } = require('../admin/setting.model');
 
 let Client = null;
 let LocalAuth = null;
@@ -52,21 +53,35 @@ const setLastError = (err) => {
         : null;
 };
 
-const normalizeAdminChatId = () => {
-    const rawNumber = String(process.env.ADMIN_NOTIFICATION_NUMBER || '').trim();
+const normalizeAdminChatId = async () => {
+    const record = await Setting.findOne({ key: 'adminNotificationWhatsApp' }).select('value').lean();
+    const rawNumber = String(record?.value || '').trim();
     if (!rawNumber) return null;
 
     const normalized = rawNumber.replace(/[^\d]/g, '');
-    return normalized ? `${normalized}@c.us` : null;
+    return /^[1-9]\d{7,14}$/.test(normalized) ? `${normalized}@c.us` : null;
 };
 
-const getStatus = () => ({
+// User profiles in this application commonly store Egyptian mobile numbers in
+// local form (for example, 01012345678). WhatsApp requires an international
+// chat id, so convert that form without changing the value saved on the user.
+const normalizeRecipientChatId = (rawNumber) => {
+    let normalized = String(rawNumber || '').replace(/[^\d]/g, '');
+    if (normalized.startsWith('00')) normalized = normalized.slice(2);
+    if (normalized.startsWith('0') && normalized.length >= 10 && normalized.length <= 11) {
+        normalized = `20${normalized.slice(1)}`;
+    }
+    if (!/^\d{8,15}$/.test(normalized)) return null;
+    return `${normalized}@c.us`;
+};
+
+const getStatus = async () => ({
     state: currentState,
     qrCode: currentState === WHATSAPP_STATE.QR_READY ? currentQrCode : null,
     hasQrCode: Boolean(currentState === WHATSAPP_STATE.QR_READY && currentQrCode),
     isConnected: currentState === WHATSAPP_STATE.CONNECTED,
     isInitializing,
-    adminNumberConfigured: Boolean(normalizeAdminChatId()),
+    adminNumberConfigured: Boolean(await normalizeAdminChatId()),
     dependencyAvailable: Boolean(Client && LocalAuth),
     lastError,
 });
@@ -276,10 +291,10 @@ const resetWhatsAppClient = async () => {
 
 const sendAdminNotification = async (message) => {
     if (config.safeLocalProductionMode) return null;
-    const chatId = normalizeAdminChatId();
+    const chatId = await normalizeAdminChatId();
 
     if (!chatId) {
-        throw new Error('ADMIN_NOTIFICATION_NUMBER is not configured.');
+        throw new Error('The notification WhatsApp number is not configured in admin settings.');
     }
 
     if (!client || currentState !== WHATSAPP_STATE.CONNECTED) {
@@ -294,6 +309,22 @@ const sendAdminNotification = async (message) => {
     return client.sendMessage(chatId, safeMessage);
 };
 
+// Sends only from the already connected server-side WhatsApp session. This is
+// deliberately separate from adminNotificationWhatsApp: payment codes belong
+// to the paying administrator's verified profile number, never an HTTP value.
+const sendWhatsAppMessage = async (phone, message) => {
+    if (config.safeLocalProductionMode) return { deliveryStatus: 'SKIPPED' };
+    const chatId = normalizeRecipientChatId(phone);
+    if (!chatId) throw new Error('The paying administrator does not have a valid WhatsApp phone number.');
+    if (!client || currentState !== WHATSAPP_STATE.CONNECTED) {
+        throw new Error('WhatsApp client is not connected.');
+    }
+    const safeMessage = String(message || '').trim();
+    if (!safeMessage) throw new Error('WhatsApp notification message cannot be empty.');
+    await client.sendMessage(chatId, safeMessage);
+    return { deliveryStatus: 'SENT' };
+};
+
 module.exports = {
     WHATSAPP_STATE,
     initializeWhatsAppClient,
@@ -302,4 +333,5 @@ module.exports = {
     destroyWhatsAppClient,
     getStatus,
     sendAdminNotification,
+    sendWhatsAppMessage,
 };

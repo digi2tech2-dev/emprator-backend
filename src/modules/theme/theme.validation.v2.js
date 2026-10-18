@@ -108,25 +108,29 @@ function validateTheme(value) {
     if (value.schemaVersion !== 2) invalid('schemaVersion');
     keysOnly(value.modes,['light','dark'],'modes');
     const modes = { light: validateAppearance(value.modes.light,'modes.light'), dark: validateAppearance(value.modes.dark,'modes.dark') };
-    keysOnly(value.brand,['logoPath','logoWidth','slides','marqueeTextArabic'],'brand');
+    keysOnly(value.brand,['logoPath','logoWidth','slides','marqueeTextArabic','targetBannerPath','sidebarTemplate'],'brand');
     const { logoPath,logoWidth,slides } = value.brand;
+    const targetBannerPath = value.brand.targetBannerPath === undefined ? null : value.brand.targetBannerPath;
     const marqueeTextArabic = value.brand.marqueeTextArabic === undefined
         ? DEFAULT_MARQUEE_AR : value.brand.marqueeTextArabic;
+    const sidebarTemplate = value.brand.sidebarTemplate === undefined ? 'default' : value.brand.sidebarTemplate;
     if (logoPath !== null && (typeof logoPath !== 'string' || !mediaPath.test(logoPath))) invalid('brand.logoPath');
     if (!Number.isInteger(logoWidth) || logoWidth<80 || logoWidth>300) invalid('brand.logoWidth');
     if (!Array.isArray(slides) || slides.length !== 4 || slides.some((slide) => slide !== null
         && (typeof slide !== 'string' || !mediaPath.test(slide)))) invalid('brand.slides');
+    if (targetBannerPath !== null && (typeof targetBannerPath !== 'string' || !mediaPath.test(targetBannerPath))) invalid('brand.targetBannerPath');
     if (typeof marqueeTextArabic !== 'string' || marqueeTextArabic !== marqueeTextArabic.trim()
         || marqueeTextArabic.length < 1 || marqueeTextArabic.length > 240
         || !/[\u0600-\u06FF]/u.test(marqueeTextArabic)
         || /[<>\u0000-\u001F\u007F]/u.test(marqueeTextArabic)) invalid('brand.marqueeTextArabic');
-    return { schemaVersion: 2, modes, brand: { logoPath, logoWidth, slides: [...slides], marqueeTextArabic } };
+    if (!['default', 'royal', 'glass'].includes(sidebarTemplate)) invalid('brand.sidebarTemplate');
+    return { schemaVersion: 2, modes, brand: { logoPath, logoWidth, slides: [...slides], marqueeTextArabic, targetBannerPath, sidebarTemplate } };
 }
 
 function preset(id) {
     if (!Object.hasOwn(palettes,id)) invalid('presetId');
     return validateTheme({ schemaVersion: 2, modes: { light: appearance(id,'light'), dark: appearance(id,'dark') },
-        brand: { logoPath: null, logoWidth: 144, slides: [null,null,null,null] } });
+        brand: { logoPath: null, logoWidth: 144, slides: [null,null,null,null], targetBannerPath: null } });
 }
 
 function safeTheme(value) {
@@ -142,23 +146,26 @@ function safeTheme(value) {
     } catch (_error) { return preset('classic'); }
 }
 
-function assertPlanAllows(theme, paid) {
-    if (paid) return;
-    for (const part of Object.values(theme.modes)) {
-        const t = part.typography;
-        if (!FREE_PRESETS.includes(part.presetId) || !FREE_FONTS_AR.includes(t.arabicFont)
-            || !FREE_FONTS_EN.includes(t.englishFont) || t.baseSize !== 16 || t.headingWeight !== 700
-            || JSON.stringify(part.buttons) !== JSON.stringify(baseButtons)
-            || JSON.stringify(part.cards) !== JSON.stringify(baseCards)
-            || JSON.stringify(part.navigation) !== JSON.stringify(baseNavigation)
-            || JSON.stringify(part.neon) !== JSON.stringify(baseNeon())) {
-            throw new AppError('This appearance requires Theme Customization Pro.',403,'THEME_PRO_REQUIRED');
+function assertPlanAllows(theme, plan = 'FREE') {
+    if (plan === 'THEME_ULTRA') return;
+    if (plan !== 'THEME_PRO') {
+        for (const part of Object.values(theme.modes)) {
+            const t = part.typography;
+            if (!FREE_PRESETS.includes(part.presetId) || !FREE_FONTS_AR.includes(t.arabicFont)
+                || !FREE_FONTS_EN.includes(t.englishFont) || t.baseSize !== 16 || t.headingWeight !== 700
+                || JSON.stringify(part.buttons) !== JSON.stringify(baseButtons)
+                || JSON.stringify(part.cards) !== JSON.stringify(baseCards)
+                || JSON.stringify(part.navigation) !== JSON.stringify(baseNavigation)
+                || JSON.stringify(part.neon) !== JSON.stringify(baseNeon())) {
+                throw new AppError('This appearance requires Theme Customization Pro.',403,'THEME_PRO_REQUIRED');
+            }
+        }
+        if (theme.brand.logoPath || theme.brand.logoWidth !== 144 || theme.brand.slides.some(Boolean) || theme.brand.targetBannerPath
+            || theme.brand.marqueeTextArabic !== DEFAULT_MARQUEE_AR) {
+            throw new AppError('Brand and animated text changes require Theme Customization Pro.',403,'THEME_PRO_REQUIRED');
         }
     }
-    if (theme.brand.logoPath || theme.brand.logoWidth !== 144 || theme.brand.slides.some(Boolean)
-        || theme.brand.marqueeTextArabic !== DEFAULT_MARQUEE_AR) {
-        throw new AppError('Brand and animated text changes require Theme Customization Pro.',403,'THEME_PRO_REQUIRED');
-    }
+    if (theme.brand.sidebarTemplate !== 'default') throw new AppError('Sidebar templates require Theme Customization Ultra.', 403, 'THEME_ULTRA_REQUIRED');
 }
 
 module.exports = { validateTheme,safeTheme,preset,allowed,assertPlanAllows,FREE_PRESETS,PRO_PRESETS,DEFAULT_MARQUEE_AR };

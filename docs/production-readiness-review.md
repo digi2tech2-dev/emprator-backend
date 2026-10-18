@@ -40,7 +40,7 @@ SMTP_PASS=<smtp-password>
 EMAIL_FROM=<verified-sender>
 TARGET_PAYMENT_LEGACY_FALLBACK_ENABLED=false
 REFERRAL_DEFAULT_COMMISSION_PERCENT=1
-ADMIN_NOTIFICATION_NUMBER=<optional-whatsapp-number>
+# Notification recipient is now adminNotificationWhatsApp in admin settings (ULTRA); ADMIN_NOTIFICATION_NUMBER is deprecated.
 WHATSAPP_AUTH_DATA_PATH=<persistent-path-if-enabled>
 WHATSAPP_CACHE_DATA_PATH=<persistent-path-if-enabled>
 ```

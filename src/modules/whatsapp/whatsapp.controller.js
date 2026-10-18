@@ -6,7 +6,7 @@ const { sendSuccess } = require('../../shared/utils/apiResponse');
 const getStatus = async (_req, res) => {
     sendSuccess(
         res,
-        whatsappService.getStatus(),
+        await whatsappService.getStatus(),
         'WhatsApp status retrieved'
     );
 };

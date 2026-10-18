@@ -19,6 +19,7 @@ const themeHistorySchema = new mongoose.Schema({
     configuration: { type: mongoose.Schema.Types.Mixed, required: true },
     version: { type: Number, required: true },
     operation: { type: String, enum: ['PUBLISH', 'RESTORE'], required: true },
+    planId: { type: String, enum: ['FREE', 'THEME_PRO', 'THEME_ULTRA'], default: 'FREE' },
     publishedAt: { type: Date, required: true },
 }, { timestamps: true });
 themeHistorySchema.index({ scopeKey: 1, version: 1 }, { unique: true });

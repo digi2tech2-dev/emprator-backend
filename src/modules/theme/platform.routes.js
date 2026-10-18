@@ -7,7 +7,7 @@ const authorize = require('../../shared/middlewares/authorize');
 const catchAsync = require('../../shared/utils/catchAsync');
 const { sendSuccess } = require('../../shared/utils/apiResponse');
 const { requirePaymentProvider } = require('./payment.provider');
-const { ThemePayment } = require('./subscription.model');
+const { ThemePayment, ThemeSubscription } = require('./subscription.model');
 const manualPayment = require('./manualPayment.service');
 const { createUpload, validateUploadedFileSignature } = require('../../shared/middlewares/upload');
 const { AppError, BusinessRuleError } = require('../../shared/errors/AppError');
@@ -25,6 +25,19 @@ const mediaLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 20 });
 const redeemLimit = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: 'draft-8',
     legacyHeaders: false, keyGenerator: (req) => req.user._id.toString(),
     message: { success: false, code: 'CODE_RATE_LIMIT', message: 'Too many code attempts.' } });
+const paymentReviewerIds = () => new Set(String(process.env.THEME_PAYMENT_REVIEWER_IDS || '')
+    .split(',').map((value) => value.trim()).filter((value) => /^[a-f\d]{24}$/i.test(value)));
+const requirePaymentReviewer = (req, _res, next) => {
+    const reviewers = paymentReviewerIds();
+    // Tests intentionally run without deployment configuration. Every real
+    // environment fails closed until the payment owner is explicitly named.
+    if (reviewers.size === 0 && process.env.NODE_ENV === 'test') return next();
+    if (reviewers.size === 0) throw new AppError('Theme payment reviewer is not configured.', 503, 'THEME_PAYMENT_REVIEWER_MISSING');
+    if (!reviewers.has(req.user._id.toString())) {
+        throw new AppError('Only the configured theme payment reviewer can confirm transfers.', 403, 'THEME_PAYMENT_REVIEW_FORBIDDEN');
+    }
+    return next();
+};
 
 router.get('/settings', catchAsync(async (_req, res) => sendSuccess(res, await service.settings())));
 router.get('/presets', (_req, res) => sendSuccess(res, { presets: service.presets(), allowed: service.allowed }));
@@ -47,21 +60,34 @@ router.get('/entitlement', catchAsync(async (_req, res) => {
 router.get('/subscription', catchAsync(async (_req, res) => {
     const state = await service.getStatus();
     return sendSuccess(res, { eligibility: state.eligibility, plan: service.plan,
-        checkoutAvailable: false, manualPayment: manualPayment.instructions() });
+        plans: service.plans, checkoutAvailable: false, manualPayment: manualPayment.instructions() });
 }));
 router.get('/subscription/payment-status', catchAsync(async (req, res) => {
     const items = await ThemePayment.find({ scopeKey: service.SCOPE_KEY, payerUserId: req.user._id })
-        .select('provider providerReference amountMinor currency status verifiedAt createdAt updatedAt settlementCurrency settlementAmount network destination')
+        .select('provider providerReference planId isUpgrade amountMinor currency status verifiedAt createdAt updatedAt settlementCurrency settlementAmount network destination activationDeliveryStatus activationDeliveryAt')
         .sort({ createdAt: -1 }).limit(20).lean();
-    return sendSuccess(res, { items });
+    const subscriptions = await ThemeSubscription.find({ verifiedPaymentId: { $in: items.map((item) => item._id) } })
+        .select('verifiedPaymentId').lean();
+    const redeemed = new Set(subscriptions.map((item) => String(item.verifiedPaymentId)));
+    return sendSuccess(res, { items: items.map((item) => ({ ...item, redeemed: redeemed.has(String(item._id)) })) });
 }));
 router.post('/subscription/manual-order', checkoutLimit, catchAsync(async (req, res) => sendSuccess(res,
-    await manualPayment.createOrder(req.user._id, req.body?.network), 'Manual USDT order created')));
+    await manualPayment.createOrder(req.user._id, req.body?.network, req.body?.planId), 'Manual USDT order created')));
+// The logged-in platform administrator enters the transaction ID only after
+// independently checking the transfer. Recipient details and the code remain
+// server-side and are never accepted from, or returned to, the browser.
+router.post('/subscription/manual-order/confirm', requirePaymentReviewer, catchAsync(async (req, res) => sendSuccess(res,
+    await manualPayment.confirmAndNotify({ reference: req.body?.reference,
+        chainTransactionId: req.body?.chainTransactionId, reviewer: req.user._id.toString() }),
+    'Payment confirmed and activation code delivery attempted')));
+router.post('/subscription/manual-order/reissue-code', requirePaymentReviewer, catchAsync(async (req, res) => sendSuccess(res,
+    await manualPayment.reissueAndNotify({ reference: req.body?.reference, reviewer: req.user._id.toString() }),
+    'Activation code delivery attempted')));
 router.post('/subscription/redeem', redeemLimit, catchAsync(async (req, res) => sendSuccess(res,
     await manualPayment.redeemCode(req.user._id, req.body?.reference, req.body?.code), 'Theme Pro activated')));
 router.post('/media/upload', mediaLimit, catchAsync(async (_req, _res, next) => {
     const state = await service.getStatus();
-    if (state.eligibility.plan !== 'THEME_PRO') throw new AppError('Theme Pro is required for brand images.', 403, 'THEME_PRO_REQUIRED');
+    if (!['THEME_PRO', 'THEME_ULTRA'].includes(state.eligibility.plan)) throw new AppError('Theme Pro or Ultra is required for brand images.', 403, 'THEME_PRO_REQUIRED');
     next();
 }), (req, res, next) => {
     createUpload('themes').single('image')(req, res, async (error) => {

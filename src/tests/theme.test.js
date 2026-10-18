@@ -6,6 +6,7 @@ const { ThemeSettings, ThemeHistory } = require('../modules/theme/theme.model');
 const { ThemeSubscription, ThemePayment, ThemeActivationCode, ThemeCodeUse } = require('../modules/theme/subscription.model');
 const theme = require('../modules/theme/theme.service');
 const manualPayment = require('../modules/theme/manualPayment.service');
+const whatsappService = require('../modules/whatsapp/whatsapp.service');
 const { preset, validateTheme, safeTheme } = require('../modules/theme/theme.validation');
 const sharp = require('sharp');
 const fs = require('fs/promises');
@@ -164,6 +165,9 @@ test('free publishing permits separate light and dark colors but locks premium f
     const proBrand = preset('classic');
     proBrand.brand.logoPath = '/uploads/themes/1234567890123-0123456789abcdef.png';
     expect((await request('/api/admin/theme/publish', admin, 'POST', proBrand)).body.code).toBe('THEME_PRO_REQUIRED');
+    proBrand.brand.logoPath = null;
+    proBrand.brand.targetBannerPath = '/uploads/themes/1234567890123-0123456789abcdef.png';
+    expect((await request('/api/admin/theme/publish', admin, 'POST', proBrand)).body.code).toBe('THEME_PRO_REQUIRED');
     for (const id of ['gold', 'silver']) {
         expect((await request('/api/admin/theme/publish', admin, 'POST', preset(id))).body.code).toBe('THEME_PRO_REQUIRED');
     }
@@ -229,6 +233,142 @@ test('manual USDT order stays pending until independently confirmed and cannot b
         chainTransactionId: 'abc123456789', reviewer: 'owner', receivedAmount: '24.99' })).rejects.toThrow();
     expect(await ThemeSubscription.countDocuments({ scopeKey: 'main' })).toBe(1);
     expect((await request('/api/admin/theme/subscription/manual-order', admin, 'POST', { network: 'TRC20' })).status).toBe(409);
+});
+
+const activatePlan = async (admin, planId = 'THEME_PRO') => {
+    const order = await manualPayment.createOrder(admin._id, 'TRC20', planId);
+    const issued = await manualPayment.confirmReceived({ reference: order.reference, network: 'TRC20',
+        chainTransactionId: `test-${order.paymentId}`, reviewer: 'test-owner', receivedAmount: order.amount,
+        planId, isUpgrade: order.isUpgrade });
+    const activated = await manualPayment.redeemCode(admin._id, order.reference, issued.code);
+    return { order, issued, activated };
+};
+
+test('Ultra direct purchase unlocks templates and retains Pro image-upload access', async () => {
+    const admin = await createAdmin();
+    const { order, activated } = await activatePlan(admin, 'THEME_ULTRA');
+    expect(order).toMatchObject({ amount: '29.99', isUpgrade: false });
+    expect(activated.plan).toBe('THEME_ULTRA');
+    expect((await theme.getStatus()).eligibility.plan).toBe('THEME_ULTRA');
+    const configuration = preset('gold');
+    configuration.brand.sidebarTemplate = 'royal';
+    expect((await theme.publish(admin._id, configuration)).published.brand.sidebarTemplate).toBe('royal');
+    // A missing file must reach upload validation, rather than the Pro-only gate.
+    const response = await request('/api/admin/theme/media/upload', admin, 'POST', {});
+    expect(response.status).not.toBe(403);
+});
+
+test('Pro upgrades for 5 USDT, keeps the original expiry and returns Ultra entitlement', async () => {
+    const admin = await createAdmin();
+    const pro = await activatePlan(admin);
+    const configuration = preset('gold');
+    configuration.brand.sidebarTemplate = 'glass';
+    await expect(theme.publish(admin._id, configuration)).rejects.toMatchObject({ code: 'THEME_ULTRA_REQUIRED' });
+    const upgrade = await activatePlan(admin, 'THEME_ULTRA');
+    expect(upgrade.order).toMatchObject({ amount: '5.00', isUpgrade: true, planId: 'THEME_ULTRA' });
+    expect(upgrade.activated.plan).toBe('THEME_ULTRA');
+    expect(upgrade.activated.expiresAt.getTime()).toBe(pro.activated.expiresAt.getTime());
+    expect((await theme.settings()).eligibility.plan).toBe('THEME_ULTRA');
+    await theme.publish(admin._id, configuration);
+    const payments = await request('/api/admin/theme/subscription/payment-status', admin);
+    expect(payments.body.data.items.every((item) => item.redeemed)).toBe(true);
+    await expect(manualPayment.redeemCode(admin._id, upgrade.order.reference, upgrade.issued.code))
+        .rejects.toMatchObject({ code: 'CODE_UNAVAILABLE' });
+});
+
+test('an expired Pro cannot confirm or redeem an upgrade for the difference', async () => {
+    const admin = await createAdmin();
+    const pro = await activatePlan(admin);
+    const order = await manualPayment.createOrder(admin._id, 'TRC20', 'THEME_ULTRA');
+    await ThemeSubscription.updateOne({ _id: pro.activated.subscriptionId }, { status: 'EXPIRED' });
+    const confirmation = { reference: order.reference, network: 'TRC20', chainTransactionId: 'upgrade-expiry-test',
+        reviewer: 'owner', receivedAmount: '5.00', planId: 'THEME_ULTRA', isUpgrade: true };
+    await expect(manualPayment.confirmReceived(confirmation)).rejects.toMatchObject({ code: 'THEME_UPGRADE_UNAVAILABLE' });
+    await ThemeSubscription.updateOne({ _id: pro.activated.subscriptionId }, { status: 'ACTIVE' });
+    const issued = await manualPayment.confirmReceived(confirmation);
+    await ThemeSubscription.updateOne({ _id: pro.activated.subscriptionId }, { status: 'EXPIRED' });
+    await expect(manualPayment.redeemCode(admin._id, order.reference, issued.code))
+        .rejects.toMatchObject({ code: 'THEME_UPGRADE_UNAVAILABLE' });
+    expect((await theme.getStatus()).eligibility.plan).toBe('FREE');
+});
+
+test('legacy pending Pro orders without plan metadata can still be confirmed and redeemed', async () => {
+    const admin = await createAdmin();
+    const order = await manualPayment.createOrder(admin._id, 'TRC20');
+    await ThemePayment.collection.updateOne({ _id: order.paymentId }, { $unset: { planId: '', isUpgrade: '' } });
+    expect((await manualPayment.createOrder(admin._id, 'TRC20')).reference).toBe(order.reference);
+    const issued = await manualPayment.confirmReceived({ reference: order.reference, network: 'TRC20',
+        chainTransactionId: 'legacy-plan-metadata', reviewer: 'owner', receivedAmount: '24.99' });
+    expect((await manualPayment.redeemCode(admin._id, order.reference, issued.code)).plan).toBe('THEME_PRO');
+    expect((await theme.getStatus()).eligibility.plan).toBe('THEME_PRO');
+});
+
+test('the third free change is blocked even after cooldown, including restore', async () => {
+    const admin = await createAdmin();
+    expect((await theme.getStatus()).eligibility.freeChangesRemaining).toBe(2);
+    await theme.publish(admin._id, preset('classic'));
+    await ThemeSettings.updateOne({ scopeKey: 'main' }, { lastSuccessfulPublishAt: new Date(Date.now() - 31 * 86400000) });
+    await theme.restore(admin._id, 1);
+    await ThemeSettings.updateOne({ scopeKey: 'main' }, { lastSuccessfulPublishAt: new Date(Date.now() - 31 * 86400000) });
+    expect((await theme.getStatus()).eligibility).toMatchObject({ canPublish: false, freeChangesRemaining: 0 });
+    await expect(theme.publish(admin._id, preset('warm'))).rejects.toMatchObject({ code: 'THEME_FREE_LIMIT' });
+    await expect(theme.restore(admin._id, 1)).rejects.toMatchObject({ code: 'THEME_FREE_LIMIT' });
+    await activatePlan(admin);
+    await theme.publish(admin._id, preset('gold'));
+    expect((await theme.getStatus()).eligibility.canPublish).toBe(true);
+});
+
+test('paid theme changes do not consume the two free changes', async () => {
+    const admin = await createAdmin();
+    const pro = await activatePlan(admin);
+    await theme.publish(admin._id, preset('gold'));
+    await theme.publish(admin._id, preset('silver'));
+    await ThemeSubscription.updateOne({ _id: pro.activated.subscriptionId }, { status: 'EXPIRED' });
+    expect((await theme.getStatus()).eligibility.freeChangesRemaining).toBe(2);
+});
+
+test('manual confirmation sends the generated code only to the payer WhatsApp and never returns it', async () => {
+    const admin = await createAdmin({ phone: '01012345678' });
+    const order = await request('/api/admin/theme/subscription/manual-order', admin, 'POST', { network: 'TRC20' });
+    const sendSpy = jest.spyOn(whatsappService, 'sendWhatsAppMessage').mockResolvedValue({ deliveryStatus: 'SENT' });
+    try {
+        const confirmed = await request('/api/admin/theme/subscription/manual-order/confirm', admin, 'POST', {
+            reference: order.body.data.reference,
+            chainTransactionId: 'server-confirmed-tx-12345',
+        });
+        expect(confirmed.status).toBe(200);
+        expect(confirmed.body.data).toMatchObject({ reference: order.body.data.reference, deliveryStatus: 'SENT' });
+        expect(confirmed.body.data).not.toHaveProperty('code');
+        expect(sendSpy).toHaveBeenCalledWith(admin.phone, expect.stringContaining('أهلًا بحضرتك مع شركه DIGI TECH المصريه❤️'));
+        const message = sendSpy.mock.calls[0][1];
+        expect(message).toContain(`📌 مرجع الطلب: ${order.body.data.reference}`);
+        expect(message).toMatch(/🔑 كود التفعيل: \d{10}/);
+        const payment = await ThemePayment.findOne({ providerReference: order.body.data.reference }).lean();
+        expect(payment.activationDeliveryStatus).toBe('SENT');
+        expect(payment).not.toHaveProperty('activationCode');
+    } finally {
+        sendSpy.mockRestore();
+    }
+});
+
+test('only the configured payment reviewer can confirm or reissue activation codes', async () => {
+    const reviewer = await createAdmin({ phone: '01012345678' });
+    const otherAdmin = await createAdmin({ phone: '01099998888' });
+    const order = await request('/api/admin/theme/subscription/manual-order', reviewer, 'POST', { network: 'TRC20' });
+    const previousReviewers = process.env.THEME_PAYMENT_REVIEWER_IDS;
+    process.env.THEME_PAYMENT_REVIEWER_IDS = reviewer._id.toString();
+    try {
+        const rejected = await request('/api/admin/theme/subscription/manual-order/confirm', otherAdmin, 'POST', {
+            reference: order.body.data.reference,
+            chainTransactionId: 'not-authorized-tx-12345',
+        });
+        expect(rejected.status).toBe(403);
+        expect(rejected.body.code).toBe('THEME_PAYMENT_REVIEW_FORBIDDEN');
+        expect((await ThemePayment.findOne({ providerReference: order.body.data.reference })).status).toBe('PENDING');
+    } finally {
+        if (previousReviewers === undefined) delete process.env.THEME_PAYMENT_REVIEWER_IDS;
+        else process.env.THEME_PAYMENT_REVIEWER_IDS = previousReviewers;
+    }
 });
 
 test('a pending ten-month order keeps its terms while new orders use three months', async () => {
@@ -324,6 +464,7 @@ test('verified Pro admin can upload and publish a logo with a premium preset', a
         const configuration = preset('gold');
         configuration.modes.dark = preset('silver').modes.dark;
         configuration.brand.logoPath = logoPath;
+        configuration.brand.targetBannerPath = logoPath;
         configuration.brand.logoWidth = 220;
         configuration.brand.marqueeTextArabic = 'مرحبًا بك في عروض المنصة';
         configuration.modes.light.typography.arabicFont = 'Changa';
@@ -332,6 +473,7 @@ test('verified Pro admin can upload and publish a logo with a premium preset', a
         configuration.modes.dark.neon.categoryCards['507f1f77bcf86cd799439011'] = { enabled: true, color: '#F0A500', speed: 12 };
         expect((await request('/api/admin/theme/publish', admin, 'POST', configuration)).status).toBe(200);
         expect((await theme.published()).published.brand.logoPath).toBe(logoPath);
+        expect((await theme.published()).published.brand.targetBannerPath).toBe(logoPath);
         expect((await theme.published()).published.modes.light.presetId).toBe('gold');
         expect((await theme.published()).published.modes.dark.presetId).toBe('silver');
         expect((await theme.published()).published.brand.marqueeTextArabic).toBe('مرحبًا بك في عروض المنصة');

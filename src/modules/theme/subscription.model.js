@@ -5,12 +5,13 @@ const mongoose = require('mongoose');
 const subscriptionSchema = new mongoose.Schema({
     scopeKey: { type: String, enum: ['main'], required: true, index: true },
     payerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-    planId: { type: String, enum: ['THEME_PRO'], required: true },
-    amountMinor: { type: Number, enum: [2499], required: true },
+    planId: { type: String, enum: ['THEME_PRO', 'THEME_ULTRA'], required: true },
+    amountMinor: { type: Number, enum: [500, 2499, 2999], required: true },
     currency: { type: String, enum: ['USD', 'USDT'], required: true },
     status: { type: String, enum: ['ACTIVE', 'EXPIRED', 'REVOKED'], required: true },
     durationCalendarMonths: { type: Number, enum: [3, 10], default: 3 },
     verifiedPaymentId: { type: mongoose.Schema.Types.ObjectId, ref: 'PlatformThemePayment', required: true, unique: true },
+    upgradedFromSubscriptionId: { type: mongoose.Schema.Types.ObjectId, ref: 'PlatformThemeSubscription', default: null },
     startsAt: { type: Date, required: true },
     expiresAt: { type: Date, required: true, index: true },
 }, { timestamps: true });
@@ -21,6 +22,9 @@ const paymentSchema = new mongoose.Schema({
     payerUserId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
     provider: { type: String, required: true },
     providerReference: { type: String, required: true },
+    planId: { type: String, enum: ['THEME_PRO', 'THEME_ULTRA'], default: 'THEME_PRO' },
+    isUpgrade: { type: Boolean, default: false },
+    upgradedFromSubscriptionId: { type: mongoose.Schema.Types.ObjectId, ref: 'PlatformThemeSubscription', default: null },
     amountMinor: { type: Number, required: true },
     currency: { type: String, required: true },
     status: { type: String, enum: ['PENDING', 'VERIFIED', 'FAILED', 'CANCELLED', 'REFUNDED', 'CHARGEBACK'], required: true },
@@ -32,6 +36,9 @@ const paymentSchema = new mongoose.Schema({
     destination: { type: String, default: undefined },
     chainTransactionId: { type: String, default: undefined },
     verifiedBy: { type: String, default: undefined },
+    activationDeliveryStatus: { type: String, enum: ['PENDING', 'SENT', 'FAILED', 'SKIPPED'], default: undefined },
+    activationDeliveryAt: { type: Date, default: null },
+    activationDeliveryError: { type: String, default: undefined },
 }, { timestamps: true });
 paymentSchema.index({ provider: 1, providerReference: 1 }, { unique: true });
 paymentSchema.index({ provider: 1, chainTransactionId: 1 }, { unique: true,
