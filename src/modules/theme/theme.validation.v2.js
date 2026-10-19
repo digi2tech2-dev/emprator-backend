@@ -43,6 +43,25 @@ const neonSections = ['purchase', 'hero', 'categories', 'bestSellers'];
 const neonColors = { purchase: '#22D3EE', hero: '#A855F7', categories: '#34D399', bestSellers: '#F59E0B' };
 const baseNeon = () => ({ ...Object.fromEntries(neonSections.map((section) =>
     [section, { enabled: false, color: neonColors[section], speed: 5 }])), categoryCards: {} });
+const baseChrome = () => ({
+    header: { template: 'bar', height: 64, width: 100, background: '#FFFFFF', foreground: '#0F172A', accent: '#2563EB', radius: 0 },
+    bottomNav: { template: 'bar', height: 64, width: 100, background: '#FFFFFF', foreground: '#0F172A', accent: '#2563EB', radius: 0 },
+});
+const validateChromePart = (value, path, templateValues, radiusValues, heightRange, widthRange) => {
+    keysOnly(value, ['template', 'height', 'width', 'background', 'foreground', 'accent', 'radius'], path);
+    if (!templateValues.includes(value.template) || !Number.isInteger(value.height)
+        || value.height < heightRange[0] || value.height > heightRange[1]
+        || !Number.isInteger(value.width) || value.width < widthRange[0] || value.width > widthRange[1]
+        || !radiusValues.includes(value.radius)) invalid(path);
+    for (const key of ['background', 'foreground', 'accent']) {
+        if (typeof value[key] !== 'string' || !/^#[0-9a-f]{6}$/i.test(value[key])) invalid(`${path}.${key}`);
+    }
+    if (contrast(value.foreground.toUpperCase(), value.background.toUpperCase()) < 4.5
+        || contrast(value.accent.toUpperCase(), value.background.toUpperCase()) < 2.2) invalid(`${path}.contrast`);
+    return { template: value.template, height: value.height, width: value.width,
+        background: value.background.toUpperCase(), foreground: value.foreground.toUpperCase(),
+        accent: value.accent.toUpperCase(), radius: value.radius };
+};
 const mediaPath = /^\/uploads\/themes\/[0-9]+-[0-9a-f]{16}\.(?:jpe?g|png|webp)$/i;
 const invalid = (field) => { throw new ValidationError(`Invalid theme property: ${field}`); };
 const plain = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -104,7 +123,7 @@ function validateAppearance(value, path) {
 }
 
 function validateTheme(value) {
-    keysOnly(value,['schemaVersion','modes','brand'],'theme');
+    keysOnly(value,['schemaVersion','modes','brand','chrome'],'theme');
     if (value.schemaVersion !== 2) invalid('schemaVersion');
     keysOnly(value.modes,['light','dark'],'modes');
     const modes = { light: validateAppearance(value.modes.light,'modes.light'), dark: validateAppearance(value.modes.dark,'modes.dark') };
@@ -114,6 +133,12 @@ function validateTheme(value) {
     const marqueeTextArabic = value.brand.marqueeTextArabic === undefined
         ? DEFAULT_MARQUEE_AR : value.brand.marqueeTextArabic;
     const sidebarTemplate = value.brand.sidebarTemplate === undefined ? 'default' : value.brand.sidebarTemplate;
+    const inputChrome = value.chrome === undefined ? baseChrome() : value.chrome;
+    keysOnly(inputChrome, ['header', 'bottomNav'], 'chrome');
+    const chrome = {
+        header: validateChromePart(inputChrome.header, 'chrome.header', ['bar', 'floating'], [0, 4, 8, 12, 16, 24, 32], [48, 120], [60, 100]),
+        bottomNav: validateChromePart(inputChrome.bottomNav, 'chrome.bottomNav', ['bar', 'floating', 'pill'], [0, 4, 8, 12, 16, 24, 32], [48, 100], [60, 100]),
+    };
     if (logoPath !== null && (typeof logoPath !== 'string' || !mediaPath.test(logoPath))) invalid('brand.logoPath');
     if (!Number.isInteger(logoWidth) || logoWidth<80 || logoWidth>300) invalid('brand.logoWidth');
     if (!Array.isArray(slides) || slides.length !== 4 || slides.some((slide) => slide !== null
@@ -123,8 +148,8 @@ function validateTheme(value) {
         || marqueeTextArabic.length < 1 || marqueeTextArabic.length > 240
         || !/[\u0600-\u06FF]/u.test(marqueeTextArabic)
         || /[<>\u0000-\u001F\u007F]/u.test(marqueeTextArabic)) invalid('brand.marqueeTextArabic');
-    if (!['default', 'royal', 'glass'].includes(sidebarTemplate)) invalid('brand.sidebarTemplate');
-    return { schemaVersion: 2, modes, brand: { logoPath, logoWidth, slides: [...slides], marqueeTextArabic, targetBannerPath, sidebarTemplate } };
+    if (!['default', 'royal', 'glass', 'aurora', 'square', 'rounded'].includes(sidebarTemplate)) invalid('brand.sidebarTemplate');
+    return { schemaVersion: 2, modes, brand: { logoPath, logoWidth, slides: [...slides], marqueeTextArabic, targetBannerPath, sidebarTemplate }, chrome };
 }
 
 function preset(id) {
@@ -148,6 +173,10 @@ function safeTheme(value) {
 
 function assertPlanAllows(theme, plan = 'FREE') {
     if (plan === 'THEME_ULTRA') return;
+    const defaultChrome = baseChrome();
+    if (JSON.stringify(theme.chrome) !== JSON.stringify(defaultChrome)) {
+        throw new AppError('Header and bottom navigation customization requires Theme Customization Ultra.', 403, 'THEME_ULTRA_REQUIRED');
+    }
     if (plan !== 'THEME_PRO') {
         for (const part of Object.values(theme.modes)) {
             const t = part.typography;

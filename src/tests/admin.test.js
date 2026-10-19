@@ -384,9 +384,9 @@ describe('[3] Admin Settings Service', () => {
 
     it('stores the owner and customer-support WhatsApp numbers as public contact settings', async () => {
         const { admin } = await setup();
-        const contacts = { owner: '01012345678', support: '+201112345678' };
+        const contacts = { owner: '+201012345678', support: '+201112345678' };
         await expect(adminSettingService.updateSetting('supportContacts', contacts, admin._id))
-            .rejects.toMatchObject({ statusCode: 400 });
+            .rejects.toMatchObject({ statusCode: 403, code: 'THEME_ULTRA_REQUIRED' });
         const startsAt = new Date(Date.now() - 1000);
         const payment = await ThemePayment.create({ scopeKey: 'main', payerUserId: admin._id, provider: 'test',
             providerReference: 'ultra-settings-fixture', planId: 'THEME_ULTRA', amountMinor: 2999,
@@ -397,8 +397,9 @@ describe('[3] Admin Settings Service', () => {
         await adminSettingService.updateSetting('supportContacts', contacts, admin._id);
 
         expect((await adminSettingService.getPaymentSettings()).supportContacts).toEqual(contacts);
-        await expect(adminSettingService.updateSetting('supportContacts', { owner: 'invalid', support: '01556537530' }, admin._id))
+        await expect(adminSettingService.updateSetting('supportContacts', { owner: '01012345678', support: '+20156537530' }, admin._id))
             .rejects.toMatchObject({ statusCode: 400 });
+        expect((await adminSettingService.getPaymentSettings()).supportContacts).toEqual(contacts);
     });
 
     it('updateSetting invalidates cached payment settings', async () => {
@@ -480,7 +481,7 @@ describe('[3] Admin Settings Service', () => {
         const whatsappService = require('../modules/whatsapp/whatsapp.service');
         expect((await whatsappService.getStatus()).adminNumberConfigured).toBe(false);
         await expect(adminSettingService.updateSetting('adminNotificationWhatsApp', '+201012345678', admin._id))
-            .rejects.toMatchObject({ statusCode: 400 });
+            .rejects.toMatchObject({ statusCode: 403, code: 'THEME_ULTRA_REQUIRED' });
         const startsAt = new Date(Date.now() - 1000);
         const payment = await ThemePayment.create({ scopeKey: 'main', payerUserId: admin._id, provider: 'test',
             providerReference: 'notification-setting', planId: 'THEME_PRO', amountMinor: 2499,
@@ -489,7 +490,7 @@ describe('[3] Admin Settings Service', () => {
             planId: 'THEME_PRO', amountMinor: 2499, currency: 'USDT', status: 'ACTIVE', verifiedPaymentId: payment._id,
             startsAt, expiresAt: themeService.addCalendarMonthsUTC(startsAt, 3) });
         await expect(adminSettingService.updateSetting('adminNotificationWhatsApp', '+201012345678', admin._id))
-            .rejects.toMatchObject({ statusCode: 400 });
+            .rejects.toMatchObject({ statusCode: 403, code: 'THEME_ULTRA_REQUIRED' });
         await ThemePayment.updateOne({ _id: payment._id }, { planId: 'THEME_ULTRA', amountMinor: 2999 });
         await ThemeSubscription.updateOne({ _id: subscription._id }, { planId: 'THEME_ULTRA', amountMinor: 2999 });
         for (const invalid of ['01012345678', '+00012345678', 'abc201012345678', '123', '+1234567890123456']) {
@@ -497,14 +498,18 @@ describe('[3] Admin Settings Service', () => {
                 .rejects.toMatchObject({ statusCode: 400 });
         }
         await adminSettingService.updateSetting('adminNotificationWhatsApp', '+٢٠١٠١٢٣٤٥٦٧٨', admin._id);
-        expect((await adminSettingService.getSettingByKey('adminNotificationWhatsApp')).value).toBe('201012345678');
+        expect((await adminSettingService.getSettingByKey('adminNotificationWhatsApp')).value).toBe('+201012345678');
         expect((await whatsappService.getStatus()).adminNumberConfigured).toBe(true);
         await adminSettingService.updateSetting('adminNotificationWhatsApp', '00447700900123', admin._id);
-        expect((await adminSettingService.getSettingByKey('adminNotificationWhatsApp')).value).toBe('447700900123');
+        expect((await adminSettingService.getSettingByKey('adminNotificationWhatsApp')).value).toBe('+447700900123');
         await adminSettingService.updateSetting('adminNotificationWhatsApp', '', admin._id);
         expect((await adminSettingService.getSettingByKey('adminNotificationWhatsApp')).value).toBe('');
         expect((await whatsappService.getStatus()).adminNumberConfigured).toBe(false);
         expect(await adminSettingService.getPaymentSettings()).not.toHaveProperty('adminNotificationWhatsApp');
+        await ThemeSubscription.updateOne({ _id: subscription._id }, { expiresAt: new Date(Date.now() - 1000) });
+        await expect(adminSettingService.updateSetting('adminNotificationWhatsApp', '+201012345678', admin._id))
+            .rejects.toMatchObject({ statusCode: 403, code: 'THEME_ULTRA_REQUIRED' });
+        expect((await adminSettingService.getSettingByKey('adminNotificationWhatsApp')).value).toBe('');
     });
 
     it('updateSetting throws NOT_FOUND for unknown key', async () => {
