@@ -346,6 +346,42 @@ test('manual confirmation sends the generated code only to the payer WhatsApp an
         const payment = await ThemePayment.findOne({ providerReference: order.body.data.reference }).lean();
         expect(payment.activationDeliveryStatus).toBe('SENT');
         expect(payment).not.toHaveProperty('activationCode');
+        const duplicate = await request('/api/admin/theme/subscription/manual-order/confirm', admin, 'POST', {
+            reference: order.body.data.reference,
+            chainTransactionId: 'server-confirmed-tx-12345',
+        });
+        expect(duplicate.status).toBe(409);
+        expect(sendSpy).toHaveBeenCalledTimes(1);
+    } finally {
+        sendSpy.mockRestore();
+    }
+});
+
+test('failed activation-code delivery is reported and does not reconfirm payment on retry', async () => {
+    const admin = await createAdmin({ phone: '01012345678' });
+    const order = await request('/api/admin/theme/subscription/manual-order', admin, 'POST', { network: 'TRC20' });
+    const sendSpy = jest.spyOn(whatsappService, 'sendWhatsAppMessage').mockRejectedValue(new Error('WhatsApp client is disconnected'));
+    try {
+        const confirmed = await request('/api/admin/theme/subscription/manual-order/confirm', admin, 'POST', {
+            reference: order.body.data.reference,
+            chainTransactionId: 'failed-delivery-tx-1234',
+        });
+        expect(confirmed.status).toBe(200);
+        expect(confirmed.body.data).toMatchObject({ deliveryStatus: 'FAILED' });
+        expect(confirmed.body.data).not.toHaveProperty('code');
+        const payment = await ThemePayment.findOne({ providerReference: order.body.data.reference }).lean();
+        expect(payment).toMatchObject({ status: 'VERIFIED', activationDeliveryStatus: 'FAILED' });
+        const queue = await manualPayment.reviewQueue();
+        expect(queue).toEqual([expect.objectContaining({
+            providerReference: order.body.data.reference,
+            deliveryError: expect.any(String),
+        })]);
+        const duplicate = await request('/api/admin/theme/subscription/manual-order/confirm', admin, 'POST', {
+            reference: order.body.data.reference,
+            chainTransactionId: 'failed-delivery-tx-1234',
+        });
+        expect(duplicate.status).toBe(409);
+        expect(sendSpy).toHaveBeenCalledTimes(1);
     } finally {
         sendSpy.mockRestore();
     }
@@ -358,6 +394,19 @@ test('only the configured payment reviewer can confirm or reissue activation cod
     const previousReviewers = process.env.THEME_PAYMENT_REVIEWER_IDS;
     process.env.THEME_PAYMENT_REVIEWER_IDS = reviewer._id.toString();
     try {
+        const queue = await request('/api/admin/theme/subscription/review-queue', reviewer);
+        expect(queue.status).toBe(200);
+        expect(queue.body.data.items).toEqual([expect.objectContaining({
+            providerReference: order.body.data.reference,
+            payer: expect.objectContaining({ email: reviewer.email }),
+            network: 'TRC20',
+            destination: manualPayment.destinations.TRC20,
+        })]);
+        expect(queue.body.data.items[0]).not.toHaveProperty('payer.phone');
+        expect(queue.body.data.items[0]).not.toHaveProperty('code');
+        const forbiddenQueue = await request('/api/admin/theme/subscription/review-queue', otherAdmin);
+        expect(forbiddenQueue.status).toBe(403);
+
         const rejected = await request('/api/admin/theme/subscription/manual-order/confirm', otherAdmin, 'POST', {
             reference: order.body.data.reference,
             chainTransactionId: 'not-authorized-tx-12345',

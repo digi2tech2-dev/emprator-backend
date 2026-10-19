@@ -57,6 +57,9 @@ async function deliverActivationCode({ paymentId, payerPhone, reference, code, o
             $set: { activationDeliveryStatus: 'FAILED', activationDeliveryError: safeDeliveryError(error) },
             $unset: { activationDeliveryAt: 1 },
         });
+        // Keep operational logs useful without recording the activation code,
+        // phone number, or raw WhatsApp error payload.
+        console.warn(`[ThemeSubscription] Activation-code WhatsApp delivery failed for ${reference}.`);
         return { status: 'FAILED' };
     }
 }
@@ -99,6 +102,23 @@ async function createOrder(payerUserId, network, planId = 'THEME_PRO') {
         expiresAt: upgradeSource?.expiresAt || null,
         durationCalendarMonths: payment.durationCalendarMonths ?? 3,
         whatsappUrl: `https://wa.me/${whatsapp}?text=${encodeURIComponent(message)}` };
+}
+
+async function reviewQueue() {
+    const payments = await ThemePayment.find({ scopeKey: 'main', provider: 'MANUAL_USDT', $or: [
+        { status: 'PENDING' },
+        { status: 'VERIFIED', activationDeliveryStatus: 'FAILED' },
+    ] }).select('payerUserId providerReference planId isUpgrade amountMinor currency settlementAmount settlementCurrency network destination status activationDeliveryStatus createdAt')
+        .sort({ createdAt: 1 }).limit(50).lean();
+    const users = await User.find({ _id: { $in: payments.map((payment) => payment.payerUserId) } })
+        .select('name email').lean();
+    const usersById = new Map(users.map((user) => [String(user._id), { name: user.name, email: user.email }]));
+    return payments.map((payment) => ({
+        ...payment,
+        payer: usersById.get(String(payment.payerUserId)) || null,
+        deliveryError: payment.activationDeliveryStatus === 'FAILED'
+            ? 'WhatsApp delivery failed. Check the connected session and the customer phone number.' : null,
+    }));
 }
 
 // This function records only a payment the operator has independently verified
@@ -274,4 +294,4 @@ async function redeemCode(payerUserId, reference, code) {
 }
 
 module.exports = { instructions, createOrder, confirmReceived, confirmAndNotify, reissueCode, reissueAndNotify,
-    redeemCode, destinations, offers, activationMessage };
+    redeemCode, reviewQueue, destinations, offers, activationMessage };

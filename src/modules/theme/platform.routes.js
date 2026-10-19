@@ -73,6 +73,8 @@ router.get('/subscription/payment-status', catchAsync(async (req, res) => {
 }));
 router.post('/subscription/manual-order', checkoutLimit, catchAsync(async (req, res) => sendSuccess(res,
     await manualPayment.createOrder(req.user._id, req.body?.network, req.body?.planId), 'Manual USDT order created')));
+router.get('/subscription/review-queue', requirePaymentReviewer, catchAsync(async (_req, res) => sendSuccess(res,
+    { items: await manualPayment.reviewQueue() }, 'Theme payment review queue')));
 // The logged-in platform administrator enters the transaction ID only after
 // independently checking the transfer. Recipient details and the code remain
 // server-side and are never accepted from, or returned to, the browser.
