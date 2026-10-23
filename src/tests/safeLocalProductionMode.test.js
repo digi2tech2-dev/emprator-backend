@@ -56,7 +56,48 @@ describe('SAFE_LOCAL_PRODUCTION_MODE', () => {
     test('makes outbound email and WhatsApp notifications no-ops', async () => {
         config.safeLocalProductionMode = true;
         await expect(sendEmail({ to: 'nobody@example.invalid', subject: 'test', text: 'test' })).resolves.toBeUndefined();
-        await expect(whatsappService.initializeWhatsAppClient()).resolves.toEqual(expect.any(Object));
+        // getStatus reads the configured admin number even in safe mode.
+        // Keep this unit test independent of a database connection.
+        const { Setting } = require('../modules/admin/setting.model');
+        const statusSettings = jest.spyOn(Setting, 'findOne').mockReturnValue({
+            select: () => ({ lean: async () => null }),
+        });
+        try {
+            await expect(whatsappService.initializeWhatsAppClient()).resolves.toEqual(expect.any(Object));
+        } finally { statusSettings.mockRestore(); }
         await expect(whatsappService.sendAdminNotification('must not send')).resolves.toBeNull();
+    });
+});
+
+
+describe('production background job startup policy', () => {
+    const originalEnv = { ...process.env };
+    afterEach(() => { process.env = { ...originalEnv }; });
+    const inputs = () => ({
+        appInstance: { listen: jest.fn(() => ({ close: jest.fn() })) }, connectDatabase: jest.fn(),
+        fulfillment: { start: jest.fn(), stop: jest.fn() }, providerSync: { start: jest.fn(), stop: jest.fn() },
+        whatsapp: { initializeWhatsAppClient: jest.fn() }, registerProcessHandlers: false, exitOnFailure: false,
+    });
+    test('rejects accidental disable before database or listener initialization', async () => {
+        Object.assign(process.env, { NODE_ENV: 'production', BACKGROUND_JOBS_ENABLED: 'false',
+            BACKGROUND_JOBS_MAINTENANCE: 'false', BACKGROUND_JOBS_DISABLED_REASON: '' });
+        const deps = inputs();
+        await expect(startServer(deps)).rejects.toThrow('BACKGROUND_JOBS_MAINTENANCE');
+        expect(deps.connectDatabase).not.toHaveBeenCalled();
+        expect(deps.appInstance.listen).not.toHaveBeenCalled();
+        expect(deps.fulfillment.start).not.toHaveBeenCalled();
+    });
+    test('acknowledged maintenance starts API with no background jobs', async () => {
+        const oldSafeMode = config.safeLocalProductionMode;
+        config.safeLocalProductionMode = false;
+        Object.assign(process.env, { NODE_ENV: 'production', BACKGROUND_JOBS_ENABLED: 'false',
+            BACKGROUND_JOBS_MAINTENANCE: 'true', BACKGROUND_JOBS_DISABLED_REASON: 'test maintenance', WHATSAPP_AUTO_INIT: 'false' });
+        const deps = inputs();
+        try {
+            await startServer(deps);
+            expect(deps.appInstance.listen).toHaveBeenCalledTimes(1);
+            expect(deps.fulfillment.start).not.toHaveBeenCalled();
+            expect(deps.providerSync.start).not.toHaveBeenCalled();
+        } finally { config.safeLocalProductionMode = oldSafeMode; }
     });
 });

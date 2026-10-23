@@ -31,7 +31,7 @@ const isUncertainPlacementError = (error) => {
     if (numericCode === 111 || numericCode === 130) return false;
     if (httpStatus && httpStatus < 500) return false;
     if (httpStatus >= 500) return true;
-    if (['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ENETUNREACH', 'ECONNREFUSED'].includes(code)) return true;
+    if (['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ENETUNREACH', 'ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'].includes(code)) return true;
     return /timeout|timed out|socket|network|connection reset/i.test(message);
 };
 
@@ -91,7 +91,7 @@ class CanonicalB2BAdapter extends BaseProviderAdapter {
     _readCheckItems(data) {
         if (Array.isArray(data?.data)) return data.data;
         if (Array.isArray(data)) return data;
-        return [];
+        throw new Error('[CanonicalB2B] Invalid check response');
     }
 
     _normaliseCheckItem(item) {

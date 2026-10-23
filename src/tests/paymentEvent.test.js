@@ -244,3 +244,31 @@ describe('future auto-approval path', () => {
         expect(await WalletTransaction.countDocuments({ userId: customer._id })).toBe(1);
     });
 });
+
+
+describe('explicit sender phone deposits', () => {
+    test('phone plus amount cannot match or auto-approve without a real transaction reference', async () => {
+        bridgeConfig.autoApprove = true;
+        const { customer } = await createCustomerWithGroup({ currency: 'EGP', walletBalance: 100 });
+        const deposit = await depositService.createDepositRequest({ userId: customer._id, paymentMethodId: 'vodafone',
+            requestedAmount: 500, currency: 'EGP', amountUsd: 10, exchangeRate: 50, isElectronicWallet: true,
+            senderPhoneNumber: '01012572681', receiptImage: 'uploads/deposits/fixture.png',
+            notes: 'transaction id: 022494991382' });
+        const response = await postEvent(walletSms());
+        expect(response.body.matched).toBe(false);
+        expect(response.body.autoApproved).toBe(false);
+        expect((await DepositRequest.findById(deposit._id)).status).toBe(DEPOSIT_STATUS.PENDING);
+        expect((await User.findById(customer._id)).walletBalance).toBe(100);
+    });
+});
+
+
+test('explicit international sender phone is not ignored by the Egyptian SMS matcher', async () => {
+    const { customer } = await createCustomerWithGroup({ currency: 'EGP' });
+    const deposit = await depositService.createDepositRequest({ userId: customer._id, paymentMethodId: 'vodafone',
+        transactionId: '022494991382', requestedAmount: 500, currency: 'EGP', amountUsd: 10, exchangeRate: 50,
+        isElectronicWallet: true, senderPhoneNumber: '+966501234567', receiptImage: 'uploads/deposits/fixture.png' });
+    const response = await postEvent(walletSms());
+    expect(response.body.matched).toBe(false);
+    expect((await DepositRequest.findById(deposit._id)).status).toBe(DEPOSIT_STATUS.PENDING);
+});

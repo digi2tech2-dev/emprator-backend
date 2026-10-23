@@ -106,6 +106,13 @@ const runOnce = async (adapterOptions = {}) => {
  * @param {Object} [adapterOptions]                - adapter override (tests only)
  */
 const start = (schedule = '0 0,6,12,18 * * *', adapterOptions = {}) => {
+    const policy = require('../../config/backgroundJobs').backgroundJobsPolicy(process.env);
+    if (policy.errors.length) throw new Error(policy.errors.join(' '));
+    if (!policy.enabled || process.env.SAFE_LOCAL_PRODUCTION_MODE === 'true') {
+        console.warn('[BackgroundJobs] Scheduler disabled by runtime policy.');
+        return;
+    }
+
     if (process.env.NODE_ENV === 'test') {
         console.log('[SyncJob] Skipped in test environment.');
         return;

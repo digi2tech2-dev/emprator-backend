@@ -3,7 +3,7 @@
 /**
  * fulfillmentJob.js
  *
- * Background cron job that polls PROCESSING orders every 5 minutes.
+ * Background cron job that polls PROCESSING orders every 10 seconds by default.
  *
  * Lifecycle:
  *   start()   — schedule the job (called once from server.js after DB connects)
@@ -22,6 +22,7 @@
  */
 
 const cron = require('node-cron');
+const { getOrderPollSchedule } = require('../../config/orderPolling');
 const { pollProcessingOrders } = require('../orders/orderFulfillment.service');
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -64,7 +65,7 @@ const runOnce = async (providerOverride = null) => {
         return stats;
 
     } catch (err) {
-        console.error('[FulfillmentJob] Unhandled error in polling cycle:', err.message);
+        console.error('[FulfillmentJob] Unhandled error in polling cycle:', require('./safePollError').safePollError(err));
         return null;
     } finally {
         _running = false;
@@ -77,10 +78,17 @@ const runOnce = async (providerOverride = null) => {
  * Start the cron scheduler.
  * Call once from server.js after the DB connection is established.
  *
- * @param {string} [schedule='*\/5 * * * *']  - cron expression (default: every 5 min)
+ * @param {string} [schedule] - cron expression (default: configured interval, 10 seconds)
  * @param {Object} [providerOverride]          - inject single provider (tests only)
  */
-const start = (schedule = '*/5 * * * *', providerOverride = null) => {
+const start = (schedule = getOrderPollSchedule(), providerOverride = null) => {
+    const policy = require('../../config/backgroundJobs').backgroundJobsPolicy(process.env);
+    if (policy.errors.length) throw new Error(policy.errors.join(' '));
+    if (!policy.enabled || process.env.SAFE_LOCAL_PRODUCTION_MODE === 'true') {
+        console.warn('[BackgroundJobs] Scheduler disabled by runtime policy.');
+        return;
+    }
+
     if (process.env.NODE_ENV === 'test') {
         console.log('[FulfillmentJob] Skipped in test environment.');
         return;
@@ -97,7 +105,8 @@ const start = (schedule = '*/5 * * * *', providerOverride = null) => {
         await runOnce(providerOverride);
     });
 
-    console.log('[FulfillmentJob] Fulfillment cron job started.');
+    console.log('[FulfillmentJob] Fulfillment cron job started; checking existing orders immediately.');
+    void runOnce(providerOverride);
 };
 
 /**

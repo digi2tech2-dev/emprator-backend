@@ -2,7 +2,9 @@
 
 require('dotenv').config();
 
-const errors = [];
+const { backgroundJobsPolicy } = require('../src/config/backgroundJobs');
+const jobs = backgroundJobsPolicy(process.env);
+const errors = [...jobs.errors];
 const warnings = [];
 const value = (key) => String(process.env[key] || '').trim();
 const isHttpUrl = (raw) => {
@@ -30,7 +32,7 @@ if (value('SAFE_LOCAL_PRODUCTION_MODE').toLowerCase() === 'true') {
     errors.push('SAFE_LOCAL_PRODUCTION_MODE must not be true in production.');
 }
 if (value('BACKGROUND_JOBS_ENABLED').toLowerCase() === 'false') {
-    warnings.push('BACKGROUND_JOBS_ENABLED=false: provider and fulfillment jobs will remain disabled.');
+    warnings.push('BACKGROUND_JOBS_ENABLED=false: order polling and catalog sync are disabled; explicit maintenance acknowledgment is required.');
 }
 if (value('WHATSAPP_AUTO_INIT').toLowerCase() === 'false') {
     warnings.push('WHATSAPP_AUTO_INIT=false: WhatsApp notifications will remain disabled.');

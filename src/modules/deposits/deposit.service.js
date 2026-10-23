@@ -1,6 +1,7 @@
 'use strict';
 
 const mongoose = require('mongoose');
+const { normalizePhone } = require('../../shared/utils/phone');
 const Decimal = require('decimal.js');
 const { DepositRequest, DEPOSIT_STATUS } = require('./deposit.model');
 const { getDepositPaymentMethodRequirements } = require('./depositPaymentMethod.service');
@@ -67,6 +68,26 @@ const normalizeSenderDetails = (source = {}) => {
         ? source.senderDetails
         : safeParseJson(source.senderDetails);
     const details = rawDetails && typeof rawDetails === 'object' ? rawDetails : {};
+    // Explicit opt-in: never reinterpret a transaction ID or an old wallet/address.
+    if (Object.prototype.hasOwnProperty.call(source, 'senderPhoneNumber') || details.field === 'senderPhoneNumber') {
+        const rawPhone = Object.prototype.hasOwnProperty.call(source, 'senderPhoneNumber')
+            ? source.senderPhoneNumber : details.value;
+        if (rawPhone != null && (typeof rawPhone !== 'string' || rawPhone.length > 64)) {
+            throw new BusinessRuleError('senderPhoneNumber must be a phone string of at most 64 characters.', 'PHONE_INVALID');
+        }
+        const phone = normalizePhone(rawPhone, { required: true });
+        if (details.value != null && String(details.value).trim()
+            && normalizePhone(details.value, { required: true }) !== phone) {
+            throw new BusinessRuleError('Sender details conflict with senderPhoneNumber.', 'SENDER_DETAILS_CONFLICT');
+        }
+        return {
+            methodType: String(details.methodType || source.paymentMethodType || '').trim().toLowerCase().slice(0, 64),
+            field: 'senderPhoneNumber',
+            label: '\u0631\u0642\u0645 \u0627\u0644\u0647\u0627\u062a\u0641 \u0627\u0644\u0645\u062d\u0648\u0644 \u0645\u0646\u0647',
+            value: phone,
+        };
+    }
+
     const value = String(
         details.value
         || source.senderDetailValue
@@ -104,6 +125,17 @@ const normalizeSenderDetails = (source = {}) => {
     };
 };
 
+// Shared by both HTTP entry points and direct service callers.
+const validateDepositEvidence = ({ isElectronicWallet, transactionId, senderDetails, hasReceipt }) => {
+    const phoneSubmission = senderDetails?.field === 'senderPhoneNumber';
+    if (isElectronicWallet && !transactionId && !phoneSubmission) {
+        throw new BusinessRuleError('transactionId is required for Electronic Wallet deposits.', 'TRANSACTION_ID_REQUIRED');
+    }
+    if ((!isElectronicWallet || phoneSubmission) && !hasReceipt) {
+        throw new BusinessRuleError('Receipt image is required. Please upload a file.', 'RECEIPT_REQUIRED');
+    }
+};
+
 // =============================================================================
 // CREATE
 // =============================================================================
@@ -130,6 +162,7 @@ const normalizeSenderDetails = (source = {}) => {
  * @param {string|null}     [params.receiptImage]
  * @param {string|null}     [params.transactionId]
  * @param {string|null}     [params.notes]
+ * @param {string}          [params.senderPhoneNumber] - explicit phone + receipt flow
  * @param {Object|null}     [params.senderDetails]
  * @param {Object|null}     [params.paymentMethodRequirements]
  * @param {Object|null}     [params.auditContext]
@@ -148,6 +181,7 @@ const createDepositRequest = async ({
     isElectronicWallet = false,
     notes = null,
     senderDetails = null,
+    senderPhoneNumber,
     paymentMethodRequirements = null,
     auditContext = null,
 }) => {
@@ -166,12 +200,14 @@ const createDepositRequest = async ({
     );
 
     const normalizedTransactionId = transactionId ? String(transactionId).trim() : null;
-    if (isElectronicWallet && !normalizedTransactionId) {
-        throw new BusinessRuleError(
-            'transactionId is required for Electronic Wallet deposits.',
-            'TRANSACTION_ID_REQUIRED'
-        );
+    if (senderPhoneNumber !== undefined || senderDetails?.field === 'senderPhoneNumber') {
+        senderDetails = normalizeSenderDetails({
+            senderDetails,
+            ...(senderPhoneNumber !== undefined ? { senderPhoneNumber } : {}),
+        });
     }
+    validateDepositEvidence({ isElectronicWallet, transactionId: normalizedTransactionId,
+        senderDetails, hasReceipt: Boolean(receiptImage) });
 
     // A provider transaction reference represents one real payment and must
     // never be reused for another deposit request.
@@ -187,13 +223,6 @@ const createDepositRequest = async ({
                 'TRANSACTION_ID_ALREADY_USED'
             );
         }
-    }
-
-    if (!isElectronicWallet && !receiptImage) {
-        throw new BusinessRuleError(
-            'Receipt image is required. Please upload a file.',
-            'RECEIPT_REQUIRED'
-        );
     }
 
     const deposit = await DepositRequest.create({
@@ -227,7 +256,8 @@ const createDepositRequest = async ({
             exchangeRate,
             amountUsd: deposit.amountUsd,
             paymentMethodFeePercentSnapshot: deposit.paymentMethodFeePercentSnapshot,
-            senderDetails,
+            senderDetails: senderDetails?.field === 'senderPhoneNumber'
+                ? { ...senderDetails, value: '[REDACTED]' } : senderDetails,
         },
         ipAddress: auditContext?.ipAddress ?? null,
         userAgent: auditContext?.userAgent ?? null,
@@ -787,4 +817,5 @@ module.exports = {
     getDepositById,
     updatePendingDeposit,
     normalizeSenderDetails,
+    validateDepositEvidence,
 };

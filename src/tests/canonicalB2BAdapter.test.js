@@ -61,3 +61,26 @@ describe('CanonicalB2BAdapter', () => {
         expect(client.get).toHaveBeenCalledWith('/check', { params: { uuids: 'KA-REF-2' } });
     });
 });
+
+
+test('token resolution skips blank apiToken and uses legacy apiKey', () => {
+    const adapter = new CanonicalB2BAdapter({ ...provider, apiToken: '   ', apiKey: 'legacy-test-key' }, { httpClient: makeClient() });
+    expect(adapter._resolveToken()).toBe('legacy-test-key');
+    expect(() => new CanonicalB2BAdapter({ ...provider, apiToken: '', apiKey: '' }, { httpClient: makeClient() })).toThrow('api token');
+});
+
+test('DNS failure during placement stays uncertain and only performs reference lookup', async () => {
+    const client = makeClient({ post: jest.fn().mockRejectedValue(Object.assign(new Error('DNS'), { code: 'ENOTFOUND' })),
+        get: jest.fn().mockRejectedValue(Object.assign(new Error('DNS'), { code: 'ENOTFOUND' })) });
+    const adapter = new CanonicalB2BAdapter(provider, { httpClient: client });
+    await expect(adapter.placeOrder({ externalProductId: '1001', quantity: 1, referenceId: 'test-ref' }))
+        .resolves.toMatchObject({ success: true, providerStatus: 'PLACEMENT_UNCERTAIN' });
+    expect(client.post).toHaveBeenCalledTimes(1);
+});
+
+
+test('polling rejects malformed or authentication envelopes without synthesizing a terminal result', async () => {
+    const client = makeClient({ get: jest.fn().mockResolvedValue({ data: { error: 'api token is required' } }) });
+    const adapter = new CanonicalB2BAdapter(provider, { httpClient: client });
+    await expect(adapter.checkOrders(['remote-id'])).rejects.toThrow('Invalid check response');
+});

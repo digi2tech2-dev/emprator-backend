@@ -22,6 +22,9 @@ const startServer = async ({
     exitOnFailure = true,
 } = {}) => {
     try {
+        const jobs = config.backgroundJobsPolicy(process.env);
+        if (jobs.errors.length) throw new Error(jobs.errors.join(' '));
+
         // 1. Connect to MongoDB first
         await connectDatabase();
 
@@ -37,17 +40,17 @@ const startServer = async ({
             console.log('');
         });
 
-        // Safe local mode overrides all legacy startup controls. Outside that
-        // mode, preserve the existing BACKGROUND_JOBS_ENABLED and
-        // WHATSAPP_AUTO_INIT behavior unchanged.
+        // Safe local inspection suppresses all jobs and WhatsApp initialization.
+        // Otherwise use the validated background-job policy and WhatsApp flag.
         if (config.safeLocalProductionMode) {
             console.warn('[Startup] SAFE_LOCAL_PRODUCTION_MODE=true: jobs and WhatsApp initialization are disabled.');
         } else {
-            if (!isExplicitlyDisabled(process.env.BACKGROUND_JOBS_ENABLED)) {
+            if (jobs.enabled) {
                 fulfillment.start();
                 providerSync.start();
+                console.log('[Startup] Order polling enabled (see FulfillmentJob schedule); catalog sync enabled.');
             } else {
-                console.log('[Startup] Background jobs are disabled by BACKGROUND_JOBS_ENABLED=false.');
+                console.warn(`[Startup] Background jobs disabled; maintenance acknowledged=${jobs.maintenance}.`);
             }
 
             if (!isExplicitlyDisabled(process.env.WHATSAPP_AUTO_INIT)) {

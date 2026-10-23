@@ -26,6 +26,13 @@ const createDepositValidation = [
         .isString().withMessage('paymentMethodId must be a string')
         .trim(),
 
+    body('senderPhoneNumber')
+        .optional()
+        .custom((value) => {
+            require('./deposit.service').normalizeSenderDetails({ senderPhoneNumber: value });
+            return true;
+        }),
+
     body('transactionId')
         .optional({ checkFalsy: true })
         .isString().withMessage('transactionId must be a string')

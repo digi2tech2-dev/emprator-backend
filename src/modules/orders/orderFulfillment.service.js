@@ -20,6 +20,8 @@
  */
 
 const mongoose = require('mongoose');
+const { safePollError } = require('./safePollError');
+const { nextPollingRetry } = require('../../config/orderPolling');
 const { Order, ORDER_STATUS, MAX_RETRY_COUNT, ORDER_EXECUTION_TYPES } = require('../orders/order.model');
 const { getExternalProductId } = require('../products/product.service');
 const { refundWalletAtomic } = require('../wallet/wallet.service');
@@ -43,123 +45,67 @@ const { notifyOrderCompleted, notifyOrderFailed } = require('../notifications/no
  * Atomically refund a failed order exactly once.
  *
  * CROSS-CURRENCY SAFE:
- *   Uses order.usdAmount (the USD truth frozen at order time) and converts
- *   it to the user's CURRENT currency rate before crediting the wallet.
+ *   Refunds the original wallet debit without applying a current exchange rate.
  *
- * Guard: the `refunded` boolean is set to true via a compare-and-swap
- * findOneAndUpdate so concurrent refund calls cannot double-credit the wallet.
+ * The refunded guard and wallet credit commit in the same transaction.
+ * A fresh status check protects completed orders, and concurrent calls retry
+ * through MongoDB transaction conflict handling.
  *
  * @param {Object} order  - Mongoose Order document
  * @returns {Promise<boolean>} true if refund was applied, false if already refunded
  */
 const refundFailedOrder = async (order) => {
-    // Compare-and-swap: only proceeds when refunded===false
-    const swapped = await Order.findOneAndUpdate(
-        { _id: order._id, refunded: false },
-        { $set: { refunded: true, refundedAt: new Date() } },
-        { new: true }
-    );
-
-    if (!swapped) {
-        // Already refunded by a concurrent call
-        return false;
-    }
-
-    // Execute the wallet refund inside its own session
     const session = await mongoose.startSession();
+    let refundedOrder = null;
+    let refundWallet = 0;
+    let refundCredit = 0;
     try {
-        session.startTransaction({
-            readConcern: { level: 'snapshot' },
-            writeConcern: { w: 'majority' },
-        });
-
-        // ── Use the EXACT amounts originally deducted ────────────────────
-        // NEVER do a live currency conversion. Exchange rates fluctuate.
-        // The user must receive back exactly what was taken from their wallet.
-        //
-        // Source of truth (frozen at order creation):
-        //   walletDeducted   – amount debited from the net wallet balance
-        //   creditUsedAmount – informational credit drawn by that debit
-        //   chargedAmount    – total (fallback for legacy orders)
-        const walletPortion = Number(order.walletDeducted || 0);
-        const creditPortion = Number(order.creditUsedAmount || 0);
-        const chargedPortion = Number(order.chargedAmount || 0);
-        const isLegacySplitRefund = walletPortion > 0
-            && creditPortion > 0
-            && chargedPortion > 0
-            && Math.abs((walletPortion + creditPortion) - chargedPortion) < 0.01;
-
-        // Fallback: if split fields are 0 but chargedAmount exists, use it
-        const refundWallet = walletPortion > 0
-            ? (isLegacySplitRefund ? walletPortion + creditPortion : walletPortion)
-            : (creditPortion > 0 ? creditPortion : Number(order.chargedAmount || 0));
-        const refundCredit = creditPortion;
-        const totalRefund = refundWallet;
-
-        if (totalRefund <= 0) {
-            // Nothing to refund — undo the CAS flag and bail
-            await Order.findByIdAndUpdate(order._id, { $set: { refunded: false, refundedAt: null } });
-            console.error(`[Fulfillment] refundFailedOrder: order ${order._id} has 0 refundable amount (walletDeducted=${order.walletDeducted}, chargedAmount=${order.chargedAmount})`);
-            return false;
-        }
-
-        await refundWalletAtomic({
-            userId: order.userId,
-            walletDeducted: refundWallet,
-            creditUsedAmount: refundCredit,
-            reference: order._id,
-            description: `Auto-refund: provider order ${order.providerOrderId ?? 'N/A'} failed (${totalRefund} ${order.currency || 'USD'})`,
-            session,
-        });
-
-        await session.commitTransaction();
-
-        // Audit — fire-and-forget, after commit
-        createAuditLog({
-            actorId: order.userId,
-            actorRole: ACTOR_ROLES.SYSTEM,
-            action: ORDER_ACTIONS.REFUNDED,
-            entityType: ENTITY_TYPES.ORDER,
-            entityId: order._id,
-            metadata: {
-                orderId: order._id.toString(),
-                providerOrderId: order.providerOrderId,
-                currency: order.currency,
-                walletRefunded: refundWallet,
-                creditRefunded: refundCredit,
-                totalRefund,
-                originalChargedAmount: order.chargedAmount,
-                originalWalletDeducted: order.walletDeducted,
-            },
-        });
-
-        createAuditLog({
-            actorId: order.userId,
-            actorRole: ACTOR_ROLES.SYSTEM,
-            action: WALLET_ACTIONS.CREDIT,
-            entityType: ENTITY_TYPES.WALLET,
-            entityId: order.userId,
-            metadata: {
-                orderId: order._id.toString(),
-                providerOrderId: order.providerOrderId,
-                walletRefunded: refundWallet,
-                creditRefunded: refundCredit,
-                totalRefund,
-                currency: order.currency,
-                reason: 'PROVIDER_ORDER_FAILED',
-            },
-        });
-
-        return true;
-
-    } catch (err) {
-        if (session.inTransaction()) await session.abortTransaction();
-        // Undo the refunded=true flag so the next retry can attempt again
-        await Order.findByIdAndUpdate(order._id, { $set: { refunded: false, refundedAt: null } });
-        throw err;
+        await session.withTransaction(async () => {
+            refundedOrder = null;
+            const current = await Order.findOne({ _id: order._id, refunded: false,
+                status: { $in: [ORDER_STATUS.PROCESSING, ORDER_STATUS.FAILED, ORDER_STATUS.CANCELED] }
+            }).session(session);
+            if (!current) return;
+            const walletPortion = Number(current.walletDeducted || 0);
+            const creditPortion = Number(current.creditUsedAmount || 0);
+            const chargedPortion = Number(current.chargedAmount || 0);
+            const isLegacySplitRefund = walletPortion > 0 && creditPortion > 0 && chargedPortion > 0
+                && Math.abs((walletPortion + creditPortion) - chargedPortion) < 0.01;
+            refundWallet = walletPortion > 0
+                ? (isLegacySplitRefund ? walletPortion + creditPortion : walletPortion)
+                : (creditPortion > 0 ? creditPortion : chargedPortion);
+            refundCredit = creditPortion;
+            if (refundWallet <= 0) return;
+            const swapped = await Order.findOneAndUpdate(
+                { _id: current._id, refunded: false, status: current.status },
+                { $set: { refunded: true, refundedAt: new Date() } },
+                { new: true, session }
+            );
+            if (!swapped) return;
+            await refundWalletAtomic({
+                userId: current.userId, walletDeducted: refundWallet, creditUsedAmount: refundCredit,
+                reference: current._id,
+                description: `Auto-refund: provider order ${current.providerOrderId ?? 'N/A'} failed (${refundWallet} ${current.currency || 'USD'})`,
+                session,
+            });
+            refundedOrder = current;
+        }, { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } });
     } finally {
-        try { session.endSession(); } catch (_) { /* already ended */ }
+        await session.endSession();
     }
+    if (!refundedOrder) return false;
+    const metadata = {
+        orderId: refundedOrder._id.toString(), providerOrderId: refundedOrder.providerOrderId,
+        currency: refundedOrder.currency, walletRefunded: refundWallet, creditRefunded: refundCredit,
+        totalRefund: refundWallet, originalChargedAmount: refundedOrder.chargedAmount,
+        originalWalletDeducted: refundedOrder.walletDeducted,
+    };
+    createAuditLog({ actorId: refundedOrder.userId, actorRole: ACTOR_ROLES.SYSTEM,
+        action: ORDER_ACTIONS.REFUNDED, entityType: ENTITY_TYPES.ORDER, entityId: refundedOrder._id, metadata });
+    createAuditLog({ actorId: refundedOrder.userId, actorRole: ACTOR_ROLES.SYSTEM,
+        action: WALLET_ACTIONS.CREDIT, entityType: ENTITY_TYPES.WALLET, entityId: refundedOrder.userId,
+        metadata: { ...metadata, reason: 'PROVIDER_ORDER_FAILED' } });
+    return true;
 };
 const { getProviderAdapter } = require('../providers/adapters/adapter.factory');
 const { Provider } = require('../providers/provider.model');
@@ -578,74 +524,39 @@ const processOrderStatusResult = async (order, statusResult) => {
 
     if (!isTerminal(providerStatus)) {
         // Still pending — bump retry count
-        const newRetry = order.retryCount + 1;
+        const retry = nextPollingRetry(order, now);
+        const newRetry = retry.retryCount;
 
         if (newRetry >= MAX_RETRY_COUNT) {
-            // Exceeded retry limit → force-fail
-            await Order.findByIdAndUpdate(order._id, {
-                $set: {
-                    status: ORDER_STATUS.FAILED,
-                    providerStatus: providerStatus,
-                    providerRawResponse: statusResult.rawResponse,
-                    retryCount: newRetry,
-                    failedAt: now,
-                    lastCheckedAt: now,
-                },
-            });
-
-            createAuditLog({
-                actorId: order.userId,
-                actorRole: ACTOR_ROLES.SYSTEM,
-                action: PROVIDER_ACTIONS.RETRY_LIMIT_EXCEEDED,
-                entityType: ENTITY_TYPES.ORDER,
-                entityId: order._id,
-                metadata: {
-                    orderId: order._id.toString(),
-                    providerOrderId: order.providerOrderId,
-                    retryCount: newRetry,
-                },
-            });
-
-            createAuditLog({
-                actorId: order.userId,
-                actorRole: ACTOR_ROLES.SYSTEM,
-                action: ORDER_ACTIONS.FAILED,
-                entityType: ENTITY_TYPES.ORDER,
-                entityId: order._id,
-                metadata: { orderId: order._id.toString(), reason: 'RETRY_LIMIT_EXCEEDED' },
-            });
-
-            const freshOrder = await Order.findById(order._id);
-            await refundFailedOrder(freshOrder).catch((e) =>
-                console.error(`[Fulfillment] Refund error (retry limit) for ${order._id}:`, e.message)
-            );
-
-            return { action: 'failed' };
+            const updated = await Order.findOneAndUpdate(
+                { _id: order._id, status: ORDER_STATUS.PROCESSING },
+                { $set: { status: ORDER_STATUS.MANUAL_REVIEW, ...retry, lastCheckedAt: now } });
+            return { action: updated ? 'manual-review' : 'skipped' };
         }
 
         // Not yet at limit — just update retry count and lastCheckedAt
-        await Order.findByIdAndUpdate(order._id, {
+        if (!await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
             $set: {
                 providerStatus: providerStatus,
                 providerRawResponse: statusResult.rawResponse,
-                retryCount: newRetry,
+                ...retry,
                 lastCheckedAt: now,
             },
-        });
+        })) return { action: 'skipped' };
 
         return { action: 'pending' };
     }
 
     // Terminal: Completed — no refund needed
     if (!requiresRefund(providerStatus)) {
-        await Order.findByIdAndUpdate(order._id, {
+        if (!await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
             $set: {
                 status: ORDER_STATUS.COMPLETED,
                 providerStatus: providerStatus,
                 providerRawResponse: statusResult.rawResponse,
                 lastCheckedAt: now,
             },
-        });
+        })) return { action: 'skipped' };
 
         createAuditLog({
             actorId: order.userId,
@@ -685,7 +596,7 @@ const processOrderStatusResult = async (order, statusResult) => {
             || '0';
         const remains = parseInt(remainsStr, 10) || 0;
 
-        await Order.findByIdAndUpdate(order._id, {
+        if (!await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
             $set: {
                 status: ORDER_STATUS.PARTIAL,
                 providerStatus: providerStatus,
@@ -693,7 +604,7 @@ const processOrderStatusResult = async (order, statusResult) => {
                 remains: remains,
                 lastCheckedAt: now,
             },
-        });
+        })) return { action: 'skipped' };
 
         createAuditLog({
             actorId: order.userId,
@@ -726,7 +637,7 @@ const processOrderStatusResult = async (order, statusResult) => {
 
     if (mappedStatus === ORDER_STATUS.CANCELED) {
         // ── CANCELED: full refund ────────────────────────────────────────
-        await Order.findByIdAndUpdate(order._id, {
+        if (!await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
             $set: {
                 status: ORDER_STATUS.CANCELED,
                 providerStatus: providerStatus,
@@ -734,7 +645,7 @@ const processOrderStatusResult = async (order, statusResult) => {
                 failedAt: now,
                 lastCheckedAt: now,
             },
-        });
+        })) return { action: 'skipped' };
 
         createAuditLog({
             actorId: order.userId,
@@ -773,7 +684,7 @@ const processOrderStatusResult = async (order, statusResult) => {
     }
 
     // ── FAILED (internal failures, rejected) — existing refund path ──────
-    await Order.findByIdAndUpdate(order._id, {
+    if (!await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
         $set: {
             status: ORDER_STATUS.FAILED,
             providerStatus: providerStatus,
@@ -781,7 +692,7 @@ const processOrderStatusResult = async (order, statusResult) => {
             failedAt: now,
             lastCheckedAt: now,
         },
-    });
+    })) return { action: 'skipped' };
 
     createAuditLog({
         actorId: order.userId,
@@ -829,14 +740,15 @@ const _escapeRegex = (str) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const recoverUncertainPlacement = async (order, adapter) => {
     const now = new Date();
     const defer = async (recovery) => {
-        const retryCount = Number(order.retryCount || 0) + 1;
+        const retry = nextPollingRetry(order, now);
+        const retryCount = retry.retryCount;
         const exhausted = retryCount >= MAX_RETRY_COUNT;
-        await Order.findByIdAndUpdate(order._id, {
+        await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
             $set: {
                 ...(exhausted ? { status: ORDER_STATUS.MANUAL_REVIEW } : {}),
                 providerStatus: 'PLACEMENT_UNCERTAIN',
                 providerRawResponse: { placement: 'uncertain', recovery },
-                retryCount,
+                ...retry,
                 lastCheckedAt: now,
             },
         });
@@ -848,7 +760,7 @@ const recoverUncertainPlacement = async (order, adapter) => {
     try {
         const result = await adapter.checkOrderByReference(order.orderNumber);
         if (!result?.found || !result.providerOrderId) return defer('not_found');
-        const recovered = await Order.findByIdAndUpdate(order._id, {
+        const recovered = await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
             $set: {
                 providerOrderId: result.providerOrderId,
                 providerStatus: result.providerStatus,
@@ -856,7 +768,7 @@ const recoverUncertainPlacement = async (order, adapter) => {
                 lastCheckedAt: now,
             },
         }, { new: true });
-        return processOrderStatusResult(recovered, result);
+        return recovered ? processOrderStatusResult(recovered, result) : { action: 'skipped' };
     } catch (_error) {
         return defer('lookup_failed');
     }
@@ -865,7 +777,7 @@ const recoverUncertainPlacement = async (order, adapter) => {
 /**
  * pollProcessingOrders(providerOverride?)
  *
- * Called by the cron job every N minutes.
+ * Called by the configured fast status-check scheduler.
  *
  * Finds all PROCESSING automatic orders with a providerOrderId, then groups
  * them by order.providerCode — the immutable slug snapshotted at order-creation
@@ -883,7 +795,7 @@ const recoverUncertainPlacement = async (order, adapter) => {
  * @param {Object|null} [providerOverride]  - single mock provider (tests only)
  * @returns {Promise<{ checked, completed, failed, pending, errors }>}
  */
-const pollProcessingOrders = async (providerOverride = null) => {
+const pollProcessingOrdersUnlocked = async (providerOverride = null) => {
     const stats = { checked: 0, completed: 0, failed: 0, pending: 0, manualReview: 0, errors: [] };
 
     // ── 1. Fetch normal provider IDs plus uncertain placement attempts ───────
@@ -922,13 +834,14 @@ const pollProcessingOrders = async (providerOverride = null) => {
 
         await Promise.all(exhausted.map(async (order) => {
             try {
-                await Order.findByIdAndUpdate(order._id, {
+                const moved = await Order.findOneAndUpdate({ _id: order._id, status: ORDER_STATUS.PROCESSING }, {
                     $set: {
                         status: ORDER_STATUS.MANUAL_REVIEW,
                         lastCheckedAt: now,
                     },
                 });
 
+                if (!moved) return;
                 createAuditLog({
                     actorId:    order.userId,
                     actorRole:  ACTOR_ROLES.SYSTEM,
@@ -951,10 +864,10 @@ const pollProcessingOrders = async (providerOverride = null) => {
                     `→ MANUAL_REVIEW (retryCount=${order.retryCount})`
                 );
             } catch (err) {
-                stats.errors.push(`[DLQ:${order._id}] ${err.message}`);
+                stats.errors.push(`[DLQ:${order._id}] ${safePollError(err)}`);
                 console.error(
                     `[FulfillmentCron] Failed to move order ${order._id} to MANUAL_REVIEW:`,
-                    err.message
+                    safePollError(err)
                 );
             }
         }));
@@ -999,8 +912,8 @@ const pollProcessingOrders = async (providerOverride = null) => {
                 const { action } = await processOrderStatusResult(order, statusResult);
                 _recordAction(action);
             } catch (err) {
-                stats.errors.push(`[${order._id}] ${err.message}`);
-                console.error(`[FulfillmentCron] Error processing order ${order._id}:`, err.message);
+                stats.errors.push(`[${order._id}] ${safePollError(err)}`);
+                console.error(`[FulfillmentCron] Error processing order ${order._id}:`, safePollError(err));
                 stats.pending++;
             }
         }
@@ -1014,7 +927,7 @@ const pollProcessingOrders = async (providerOverride = null) => {
             try {
                 _recordAction((await recoverUncertainPlacement(order, providerOverride)).action);
             } catch (err) {
-                stats.errors.push(`[${order._id}] ${err.message}`);
+                stats.errors.push(`[${order._id}] ${safePollError(err)}`);
                 stats.pending++;
             }
         }
@@ -1027,8 +940,9 @@ const pollProcessingOrders = async (providerOverride = null) => {
             const batchFn = providerOverride.checkOrdersBatch ?? providerOverride.checkOrders;
             statusResults = await batchFn.call(providerOverride, ids);
         } catch (err) {
-            stats.errors.push(`Batch check failed: ${err.message}`);
-            console.error('[FulfillmentCron] checkOrders error (override):', err.message);
+            stats.errors.push(`Batch check failed: ${safePollError(err)}`);
+            console.error('[FulfillmentCron] checkOrders error (override):', safePollError(err));
+            stats.pending += normal.length;
             return stats;
         }
         await _applyResults(normal, statusResults);
@@ -1048,13 +962,10 @@ const pollProcessingOrders = async (providerOverride = null) => {
         try {
             // ── Resolve provider doc by slug snapshot (not by product) ────────
             const { Provider } = require('../providers/provider.model');
-            const providerDoc = await Provider.findOne({
-                $or: [
-                    { slug: code },
-                    { name: { $regex: `^${_escapeRegex(code)}$`, $options: 'i' } },
-                ],
-                isActive: true,
-            });
+            const providerDoc = await Provider.findOne({ slug: code, isActive: true })
+                ?? await Provider.findOne({
+                    name: { $regex: `^${_escapeRegex(code)}$`, $options: 'i' }, isActive: true,
+                });
 
             if (!providerDoc) {
                 console.warn(
@@ -1063,17 +974,18 @@ const pollProcessingOrders = async (providerOverride = null) => {
                     `(Provider may have been deactivated or renamed.)`
                 );
                 orders.forEach(() => stats.pending++);
+                stats.errors.push(`[${code}] NO_ACTIVE_PROVIDER`);
                 continue;
             }
 
-            const adapter = getProviderAdapter(providerDoc);
+            const adapter = getProviderAdapter(providerDoc, { strict: true });
             const uncertain = orders.filter((order) => order.providerStatus === 'PLACEMENT_UNCERTAIN' && !order.providerOrderId);
             const normal = orders.filter((order) => order.providerOrderId != null);
             for (const order of uncertain) {
                 try {
                     _recordAction((await recoverUncertainPlacement(order, adapter)).action);
                 } catch (err) {
-                    stats.errors.push(`[${order._id}] ${err.message}`);
+                    stats.errors.push(`[${order._id}] ${safePollError(err)}`);
                     stats.pending++;
                 }
             }
@@ -1100,18 +1012,19 @@ const pollProcessingOrders = async (providerOverride = null) => {
                     batchErr.code === 'ECONNABORTED' ||
                     batchErr.code === 'ETIMEDOUT'    ||
                     batchErr.code === 'ECONNRESET'   ||
+                    batchErr.code === 'ENOTFOUND'    ||
                     (batchErr.response?.status ?? 0) >= 500 ||
                     String(batchErr.message ?? '').toLowerCase().includes('timeout');
 
                 console[isTransient ? 'warn' : 'error'](
                     `[FulfillmentCron] ${isTransient ? 'Transient error' : 'Error'} ` +
                     `checking batch for "${code}" (${orders.length} orders):`,
-                    batchErr.message
+                    safePollError(batchErr)
                 );
 
                 // Leave all orders in this group PROCESSING  — cron will retry.
                 normal.forEach(() => stats.pending++);
-                stats.errors.push(`[${code}] ${batchErr.message}`);
+                stats.errors.push(`[${code}] ${safePollError(batchErr)}`);
                 continue;   // don't crash the loop for other providers
             }
 
@@ -1119,8 +1032,9 @@ const pollProcessingOrders = async (providerOverride = null) => {
 
         } catch (groupErr) {
             // Unexpected crash (e.g. DB error) — log but keep going
-            console.error(`[FulfillmentCron] Group "${code}" crashed:`, groupErr.message);
-            orders.forEach(() => stats.errors.push(`[${code}] ${groupErr.message}`));
+            console.error(`[FulfillmentCron] Group "${code}" crashed:`, safePollError(groupErr));
+            stats.pending += orders.length;
+            stats.errors.push(`[${code}] ${safePollError(groupErr)}`);
         }
     }
 
@@ -1132,6 +1046,9 @@ const pollProcessingOrders = async (providerOverride = null) => {
     );
     return stats;
 };
+
+const pollProcessingOrders = (providerOverride = null) => require('./orderPollLock').withOrderPollLock(
+    () => pollProcessingOrdersUnlocked(providerOverride), { checked: 0, completed: 0, failed: 0, pending: 0, manualReview: 0, errors: [], skipped: true });
 
 module.exports = {
     executeOrder,

@@ -77,8 +77,8 @@ const analyzeReceiptUpload = catchAsync(async (req, _res, next) => {
 
 /**
  * POST /api/deposits
- * Customer creates a deposit request. Electronic Wallet methods use a
- * transactionId and do not require a receipt upload.
+ * Explicit senderPhoneNumber uses phone+receipt; legacy Electronic Wallet
+ * requests may still use a real transactionId without an upload.
  *
  * Multer middleware (createUpload('deposits').single('receipt')) runs
  * BEFORE this handler — req.file is populated on success.
@@ -89,26 +89,13 @@ const createDeposit = catchAsync(async (req, res) => {
     const { isElectronicWallet } = paymentMethodRequirements;
     const normalizedTransactionId = String(transactionId || '').trim();
 
-    if (isElectronicWallet && !normalizedTransactionId) {
-        throw new BusinessRuleError(
-            'transactionId is required for Electronic Wallet deposits.',
-            'TRANSACTION_ID_REQUIRED'
-        );
-    }
-
-    // ── Validate file upload ─────────────────────────────────────────────
-    if (!isElectronicWallet && !req.file) {
-        throw new BusinessRuleError(
-            'Receipt image is required. Please upload a file.',
-            'RECEIPT_REQUIRED'
-        );
-    }
+    const senderDetails = depositService.normalizeSenderDetails(req.body);
+    depositService.validateDepositEvidence({ isElectronicWallet, transactionId: normalizedTransactionId,
+        senderDetails, hasReceipt: Boolean(req.file) });
 
     if (req.file && !req.receiptAnalysisValidated) {
         await validateReceiptUpload(req.file);
     }
-
-    const senderDetails = depositService.normalizeSenderDetails(req.body);
 
     // ── Fetch current exchange rate ──────────────────────────────────────
     const currencyDoc = await Currency.findOne({

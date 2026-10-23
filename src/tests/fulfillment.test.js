@@ -444,7 +444,7 @@ describe('[4] processOrderStatusResult', () => {
         expect(fresh.retryCount).toBe(3);
     });
 
-    it(`Pending at retry limit (${MAX_RETRY_COUNT}) -> FAILED + refund`, async () => {
+    it(`Pending at retry limit (${MAX_RETRY_COUNT}) -> MANUAL_REVIEW without refund`, async () => {
         const order = await makeOrderDoc(customer._id, { retryCount: MAX_RETRY_COUNT - 1 });
 
         const result = await processOrderStatusResult(order, {
@@ -453,10 +453,10 @@ describe('[4] processOrderStatusResult', () => {
             rawResponse: { status: 'Pending' },
         });
 
-        expect(result.action).toBe('failed');
+        expect(result.action).toBe('manual-review');
         const fresh = await Order.findById(order._id);
-        expect(fresh.status).toBe(ORDER_STATUS.FAILED);
-        expect(fresh.refunded).toBe(true);
+        expect(fresh.status).toBe(ORDER_STATUS.MANUAL_REVIEW);
+        expect(fresh.refunded).toBe(false);
     });
 
     it('skips order that is not PROCESSING', async () => {
@@ -551,7 +551,7 @@ describe('[5] pollProcessingOrders -- cron batch', () => {
         const stats = await pollProcessingOrders(provider);
 
         expect(stats.errors.length).toBe(1);
-        expect(stats.errors[0]).toContain('Timeout');
+        expect(stats.errors[0]).toContain('PROVIDER_TIMEOUT');
         expect(stats.checked).toBe(1);
     });
 
@@ -719,5 +719,180 @@ describe('[6] createOrder -- AUTOMATIC executionType', () => {
         // Wallet debited only once
         const freshCustomer = await User.findById(customer._id);
         expect(freshCustomer.walletBalance).toBe(950);
+    });
+});
+
+
+describe('polling concurrency and stale snapshots', () => {
+    it('does not overwrite manual completion or refund from a stale PROCESSING snapshot', async () => {
+        const { customer } = await createCustomerWithGroup({ walletBalance: 1000 });
+        const order = await makeOrderDoc(customer._id, { providerOrderId: 'stale-1' });
+        await Order.findByIdAndUpdate(order._id, { $set: { status: ORDER_STATUS.COMPLETED } });
+        expect((await processOrderStatusResult(order, { providerStatus: 'reject', rawResponse: {} })).action).toBe('skipped');
+        const adapter = makeMockProvider();
+        await pollProcessingOrders(adapter);
+        await executeOrder(order._id, adapter);
+        expect(adapter.placeOrder).not.toHaveBeenCalled();
+        expect(adapter.checkOrdersBatch).not.toHaveBeenCalled();
+        const fresh = await Order.findById(order._id);
+        expect(fresh.status).toBe(ORDER_STATUS.COMPLETED);
+        expect(fresh.refunded).toBe(false);
+        expect((await User.findById(customer._id)).walletBalance).toBe(1000);
+    });
+
+    it('serializes both poller entry points while provider check is in flight', async () => {
+        const { customer } = await createCustomerWithGroup({ walletBalance: 1000 });
+        await makeOrderDoc(customer._id, { providerOrderId: 'lock-1' });
+        let release, entered;
+        const ready = new Promise(resolve => { entered = resolve; });
+        const adapter = makeMockProvider({ checkOrdersBatch: jest.fn(() => {
+            entered(); return new Promise(resolve => { release = resolve; });
+        }) });
+        const first = pollProcessingOrders(adapter);
+        await ready;
+        const { pollPendingOrders } = require('../modules/orders/orderPolling.service');
+        try {
+            expect((await pollProcessingOrders(adapter)).skipped).toBe(true);
+            expect((await pollPendingOrders()).skipped).toBe(true);
+            expect(adapter.checkOrdersBatch).toHaveBeenCalledTimes(1);
+        } finally { release([]); await first; }
+        expect((await pollProcessingOrders(makeMockProvider())).skipped).not.toBe(true);
+    });
+
+    it.each(['ENOTFOUND', 'ETIMEDOUT', 'AUTH'])('preserves PROCESSING on %s and never logs secrets', async (code) => {
+        const { customer } = await createCustomerWithGroup({ walletBalance: 1000 });
+        const order = await makeOrderDoc(customer._id, { providerOrderId: 'error-1' });
+        const error = Object.assign(new Error('api-token=super-secret-test-value'), { code });
+        if (code === 'AUTH') error.response = { status: 401, data: { token: 'super-secret-test-value' } };
+        const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+        try {
+            const stats = await pollProcessingOrders(makeMockProvider({ checkOrdersBatch: jest.fn().mockRejectedValue(error) }));
+            expect(stats.errors.length).toBe(1);
+            expect(JSON.stringify([stats, spy.mock.calls])).not.toContain('super-secret-test-value');
+            const fresh = await Order.findById(order._id);
+            expect(fresh.status).toBe(ORDER_STATUS.PROCESSING);
+            expect(fresh.refunded).toBe(false);
+        } finally { spy.mockRestore(); }
+    });
+});
+
+
+describe('provider snapshot routing and refund transactions', () => {
+    it('isolates identical upstream order IDs by providerCode and uses the registered adapterType', async () => {
+        const { Provider } = require('../modules/providers/provider.model');
+        const { registerAdapter } = require('../modules/providers/adapters/adapter.factory');
+        const calls = [];
+        registerAdapter('sync-test-only', class {
+            constructor(provider) { this.provider = provider; }
+            async checkOrders(ids) {
+                calls.push([this.provider.slug, ids]);
+                return ids.map(id => ({ providerOrderId: id,
+                    providerStatus: this.provider.slug === 'sync-fixture-a' ? 'accept' : 'reject', rawResponse: {} }));
+            }
+        });
+        await Provider.create([
+            { name: 'Sync fixture A', slug: 'sync-fixture-a', adapterType: 'sync-test-only', baseUrl: 'https://example.invalid' },
+            { name: 'Sync fixture B', slug: 'sync-fixture-b', adapterType: 'sync-test-only', baseUrl: 'https://example.invalid' },
+        ]);
+        const { customer } = await createCustomerWithGroup({ walletBalance: 1000 });
+        const a = await makeOrderDoc(customer._id, { providerOrderId: 'same-remote-id', providerCode: 'sync-fixture-a', idempotencyKey: 'fixture-a' });
+        const b = await makeOrderDoc(customer._id, { providerOrderId: 'same-remote-id', providerCode: 'sync-fixture-b', idempotencyKey: 'fixture-b' });
+        const stats = await pollProcessingOrders();
+        expect(stats.completed).toBe(1);
+        expect(stats.failed).toBe(1);
+        expect(calls).toEqual(expect.arrayContaining([
+            ['sync-fixture-a', ['same-remote-id']], ['sync-fixture-b', ['same-remote-id']],
+        ]));
+        expect((await Order.findById(a._id)).status).toBe(ORDER_STATUS.COMPLETED);
+        expect((await Order.findById(b._id)).status).toBe(ORDER_STATUS.FAILED);
+    });
+
+    it('records missing token as a safe diagnostic without changing order state', async () => {
+        const { Provider } = require('../modules/providers/provider.model');
+        await Provider.create({ name: 'Missing token fixture', slug: 'token-fixture',
+            adapterType: 'canonical-b2b', baseUrl: 'https://example.invalid' });
+        const { customer } = await createCustomerWithGroup();
+        const order = await makeOrderDoc(customer._id, { providerOrderId: 'missing-token', providerCode: 'token-fixture' });
+        const stats = await pollProcessingOrders();
+        expect(stats.errors.join(' ')).toContain('PROVIDER_TOKEN_MISSING');
+        expect((await Order.findById(order._id)).status).toBe(ORDER_STATUS.PROCESSING);
+    });
+
+    it('concurrent refund calls credit exactly once', async () => {
+        const { customer } = await createCustomerWithGroup({ walletBalance: 1000 });
+        const order = await makeOrderDoc(customer._id, { status: ORDER_STATUS.FAILED });
+        const results = await Promise.all([refundFailedOrder(order), refundFailedOrder(order)]);
+        expect(results.filter(Boolean)).toHaveLength(1);
+        expect((await User.findById(customer._id)).walletBalance).toBe(1050);
+        expect(await WalletTransaction.countDocuments({ reference: order._id, type: 'REFUND' })).toBe(1);
+    });
+
+    it('rolls back both guard and wallet when recording the refund fails', async () => {
+        const { customer } = await createCustomerWithGroup({ walletBalance: 1000 });
+        const order = await makeOrderDoc(customer._id, { status: ORDER_STATUS.FAILED });
+        const spy = jest.spyOn(WalletTransaction, 'create').mockRejectedValueOnce(new Error('test ledger write failure'));
+        try { await expect(refundFailedOrder(order)).rejects.toThrow('test ledger write failure'); }
+        finally { spy.mockRestore(); }
+        expect((await Order.findById(order._id)).refunded).toBe(false);
+        expect((await User.findById(customer._id)).walletBalance).toBe(1000);
+        await expect(refundFailedOrder(order)).resolves.toBe(true);
+    });
+});
+
+
+describe('shared polling lock recovery', () => {
+    const lockCollection = () => mongoose.connection.collection('background_job_locks');
+    const { withOrderPollLock } = require('../modules/orders/orderPollLock');
+    it('recovers only a confirmed dead owner on the same host', async () => {
+        await lockCollection().insertOne({ _id: 'order-status-poll', owner: 'dead-fixture',
+            host: require('os').hostname(), pid: 99999999 });
+        const originalKill = process.kill.bind(process);
+        const probe = jest.spyOn(process, 'kill').mockImplementation((pid, signal) => {
+            if (pid === 99999999 && signal === 0) throw Object.assign(new Error('gone'), { code: 'ESRCH' });
+            return originalKill(pid, signal);
+        });
+        try { await expect(withOrderPollLock(async () => 'ran', 'skipped')).resolves.toBe('ran'); }
+        finally { probe.mockRestore(); }
+        expect(await lockCollection().countDocuments()).toBe(0);
+    });
+    it('never steals a lock on another host and releases its own lock on failure', async () => {
+        await lockCollection().insertOne({ _id: 'order-status-poll', owner: 'remote-fixture', host: 'other-test-host', pid: 99999999 });
+        const work = jest.fn();
+        await expect(withOrderPollLock(work, 'skipped')).resolves.toBe('skipped');
+        expect(work).not.toHaveBeenCalled();
+        await lockCollection().deleteOne({ _id: 'order-status-poll', owner: 'remote-fixture' });
+        await expect(withOrderPollLock(async () => { throw new Error('test failure'); }, 'skipped')).rejects.toThrow('test failure');
+        expect(await lockCollection().countDocuments()).toBe(0);
+    });
+});
+
+
+describe('fast polling retry budget', () => {
+    it('repeated fast checks do not exhaust the existing retry window', async () => {
+        const { customer } = await createCustomerWithGroup();
+        const order = await makeOrderDoc(customer._id, { providerOrderId: 'fast-budget',
+            retryCount: MAX_RETRY_COUNT - 1, lastRetryAt: new Date() });
+        const result = { providerStatus: 'wait', rawResponse: {} };
+        await processOrderStatusResult(order, result);
+        await processOrderStatusResult(await Order.findById(order._id), result);
+        const fresh = await Order.findById(order._id);
+        expect(fresh.status).toBe(ORDER_STATUS.PROCESSING);
+        expect(fresh.retryCount).toBe(MAX_RETRY_COUNT - 1);
+        expect(fresh.refunded).toBe(false);
+        await Order.findByIdAndUpdate(order._id, { $set: { lastRetryAt: new Date(Date.now() - 300001) } });
+        expect((await processOrderStatusResult(await Order.findById(order._id), result)).action).toBe('manual-review');
+    });
+
+    it('a subsequent fast check completes a previously pending order without placing it again', async () => {
+        const { customer } = await createCustomerWithGroup();
+        const order = await makeOrderDoc(customer._id, { providerOrderId: 'fast-complete' });
+        const adapter = makeMockProvider({ checkOrdersBatch: jest.fn()
+            .mockResolvedValueOnce([{ providerOrderId: 'fast-complete', providerStatus: 'wait', rawResponse: {} }])
+            .mockResolvedValueOnce([{ providerOrderId: 'fast-complete', providerStatus: 'accept', rawResponse: {} }]) });
+        await pollProcessingOrders(adapter);
+        expect((await Order.findById(order._id)).status).toBe(ORDER_STATUS.PROCESSING);
+        await pollProcessingOrders(adapter);
+        expect((await Order.findById(order._id)).status).toBe(ORDER_STATUS.COMPLETED);
+        expect(adapter.placeOrder).not.toHaveBeenCalled();
     });
 });

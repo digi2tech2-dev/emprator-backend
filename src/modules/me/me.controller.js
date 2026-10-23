@@ -454,24 +454,9 @@ const createDeposit = catchAsync(async (req, res) => {
     const { isElectronicWallet } = paymentMethodRequirements;
     const normalizedTransactionId = String(transactionId || '').trim();
 
-    if (isElectronicWallet && !normalizedTransactionId) {
-        const { BusinessRuleError } = require('../../shared/errors/AppError');
-        throw new BusinessRuleError(
-            'transactionId is required for Electronic Wallet deposits.',
-            'TRANSACTION_ID_REQUIRED'
-        );
-    }
-
-    // ── Validate file upload ─────────────────────────────────────────────
-    if (!isElectronicWallet && !req.file) {
-        const { BusinessRuleError } = require('../../shared/errors/AppError');
-        throw new BusinessRuleError(
-            'Receipt image is required. Please upload a file.',
-            'RECEIPT_REQUIRED'
-        );
-    }
-
     const senderDetails = depositService.normalizeSenderDetails(req.body);
+    depositService.validateDepositEvidence({ isElectronicWallet, transactionId: normalizedTransactionId,
+        senderDetails, hasReceipt: Boolean(req.file) });
 
     // ── Fetch current exchange rate ──────────────────────────────────────
     const { Currency } = require('../currency/currency.model');

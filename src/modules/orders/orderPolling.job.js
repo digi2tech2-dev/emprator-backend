@@ -19,9 +19,9 @@
  *     started, but runOrderPolling() can be called directly in tests.
  *
  * Relationship to fulfillmentJob.js:
- *   fulfillmentJob.js    — handles placeOrder flow (single-provider, legacy API)
- *   orderPolling.job.js  — handles status-check polling (multi-provider, new)
- *   Both can coexist; the cron schedules are independent.
+ *   server.js starts fulfillmentJob only (configured fast status polling).
+ *   This compatibility entry point shares its database lock; never start a
+ *   second scheduler for the same queue.
  */
 
 const cron = require('node-cron');
@@ -144,6 +144,13 @@ const runOrderPolling = async (options = {}) => {
  * @param {Object} [options]               — forwarded to runOrderPolling()
  */
 const start = (schedule = '* * * * *', options = {}) => {
+    const policy = require('../../config/backgroundJobs').backgroundJobsPolicy(process.env);
+    if (policy.errors.length) throw new Error(policy.errors.join(' '));
+    if (!policy.enabled || process.env.SAFE_LOCAL_PRODUCTION_MODE === 'true') {
+        console.warn('[BackgroundJobs] Scheduler disabled by runtime policy.');
+        return;
+    }
+
     if (process.env.NODE_ENV === 'test') {
         console.log('[OrderPollingJob] Skipped in test environment.');
         return;

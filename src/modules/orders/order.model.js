@@ -287,13 +287,19 @@ const orderSchema = new mongoose.Schema(
         },
 
         /**
-         * Number of status-check attempts made by the cron job.
-         * When retryCount >= MAX_RETRY_COUNT the order is force-failed.
+         * Number of five-minute retry-budget windows consumed.
+         * At MAX_RETRY_COUNT, an unresolved order needs manual review.
          */
         retryCount: {
             type: Number,
             default: 0,
             min: 0,
+        },
+
+        /** Timestamp of the last consumed retry window; independent of poll cadence. */
+        lastRetryAt: {
+            type: Date,
+            default: null,
         },
 
         /** Timestamp of the most recent status poll. */

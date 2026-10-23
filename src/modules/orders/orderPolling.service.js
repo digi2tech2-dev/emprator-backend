@@ -53,6 +53,7 @@
  */
 
 const { Order, ORDER_STATUS } = require('./order.model');
+const { safePollError } = require('./safePollError');
 const { processOrderStatusResult } = require('./orderFulfillment.service');
 const { getProviderAdapter } = require('../providers/adapters/adapter.factory');
 const { Provider } = require('../providers/provider.model');
@@ -236,7 +237,7 @@ const pollProviderGroup = async (providerId, providerDoc, orders) => {
     try {
         adapter = getProviderAdapter(providerDoc);
     } catch (err) {
-        result.errors.push(`[adapter] ${err.message}`);
+        result.errors.push(`[adapter] ${safePollError(err)}`);
         result.pending = orders.length;
         return result;
     }
@@ -261,7 +262,7 @@ const pollProviderGroup = async (providerId, providerDoc, orders) => {
         try {
             statusResults = await adapter.checkOrders(providerOrderIds);
         } catch (err) {
-            const msg = `[checkOrders batch ${batchIdx + 1}/${batches.length}] ${err.message}`;
+            const msg = `[checkOrders batch ${batchIdx + 1}/${batches.length}] ${safePollError(err)}`;
             result.errors.push(msg);
             console.error(`[OrderPolling] Provider "${providerDoc.name}" ${msg}`);
             // Leave all orders in this batch as PROCESSING for the next cycle
@@ -290,7 +291,7 @@ const pollProviderGroup = async (providerId, providerDoc, orders) => {
                 else if (action === 'failed') result.failed++;
                 else result.pending++;   // 'pending' or 'skipped'
             } catch (err) {
-                const msg = `[order:${order._id}] ${err.message}`;
+                const msg = `[order:${order._id}] ${safePollError(err)}`;
                 result.errors.push(msg);
                 console.error(`[OrderPolling] ${msg}`);
                 result.pending++;
@@ -336,7 +337,7 @@ const pollProviderGroup = async (providerId, providerDoc, orders) => {
  *
  * @returns {Promise<PollStats>}
  */
-const pollPendingOrders = async (options = {}) => {
+const pollPendingOrdersUnlocked = async (options = {}) => {
     const { adapterOverrides = {} } = options;
     const polledAt = new Date();
 
@@ -378,8 +379,8 @@ const pollPendingOrders = async (options = {}) => {
             .sort({ lastCheckedAt: 1 })
             .limit(POLL_BATCH_LIMIT);
     } catch (err) {
-        stats.errors.push(`[db:find] ${err.message}`);
-        console.error('[OrderPolling] Failed to load PROCESSING orders:', err.message);
+        stats.errors.push(`[db:find] ${safePollError(err)}`);
+        console.error('[OrderPolling] Failed to load PROCESSING orders:', safePollError(err));
         return stats;
     }
 
@@ -445,7 +446,7 @@ const pollPendingOrders = async (options = {}) => {
             }
         } else {
             // Unexpected error escaping pollProviderGroup
-            const msg = settlement.reason?.message ?? 'Unknown error';
+            const msg = safePollError(settlement.reason);
             stats.errors.push(`[provider] ${msg}`);
             console.error('[OrderPolling] Unexpected provider poll error:', msg);
         }
@@ -498,7 +499,7 @@ const pollProviderGroupWithAdapter = async (providerId, providerDoc, orders, ada
         try {
             statusResults = await adapter.checkOrders(providerOrderIds);
         } catch (err) {
-            const msg = `[checkOrders batch ${batchIdx + 1}/${batches.length}] ${err.message}`;
+            const msg = `[checkOrders batch ${batchIdx + 1}/${batches.length}] ${safePollError(err)}`;
             result.errors.push(msg);
             console.error(`[OrderPolling] ${msg}`);
             result.pending += batch.length;
@@ -519,7 +520,7 @@ const pollProviderGroupWithAdapter = async (providerId, providerDoc, orders, ada
                 else if (action === 'failed') result.failed++;
                 else result.pending++;
             } catch (err) {
-                result.errors.push(`[order:${order._id}] ${err.message}`);
+                result.errors.push(`[order:${order._id}] ${safePollError(err)}`);
                 result.pending++;
             }
         }
@@ -531,6 +532,9 @@ const pollProviderGroupWithAdapter = async (providerId, providerDoc, orders, ada
 // =============================================================================
 // EXPORTS
 // =============================================================================
+
+const pollPendingOrders = (options = {}) => require('./orderPollLock').withOrderPollLock(
+    () => pollPendingOrdersUnlocked(options), { checkedOrders: 0, completed: 0, failed: 0, stillProcessing: 0, skippedOrders: 0, providerResults: [], errors: [], polledAt: new Date(), skipped: true });
 
 module.exports = {
     pollPendingOrders,

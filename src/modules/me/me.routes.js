@@ -246,6 +246,13 @@ const createDepositValidation = [
     body('paymentMethodId')
         .notEmpty().withMessage('paymentMethodId is required')
         .isString().trim(),
+    body('senderPhoneNumber')
+        .optional()
+        .custom((value) => {
+            require('../deposits/deposit.service').normalizeSenderDetails({ senderPhoneNumber: value });
+            return true;
+        }),
+
     body('transactionId')
         .optional({ checkFalsy: true })
         .isString().trim()
@@ -274,9 +281,9 @@ const createDepositValidation = [
 
 /**
  * @route  POST /api/me/deposits
- * @desc   Submit a deposit request (Electronic Wallet methods use transactionId without a receipt)
+ * @desc   Submit phone+receipt deposits, or the compatible legacy transactionId flow
  * @access Active user
- * @body   multipart/form-data: requestedAmount, currency, paymentMethodId, transactionId?, receipt? (required except Electronic Wallet), notes?
+ * @body   multipart/form-data: requestedAmount, currency, paymentMethodId, senderPhoneNumber? (requires receipt), transactionId?, receipt? (legacy rules retained), notes?
  */
 router.post(
     '/deposits',

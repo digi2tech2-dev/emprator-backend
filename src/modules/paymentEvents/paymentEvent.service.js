@@ -88,6 +88,8 @@ const depositUsesVodafoneCash = (deposit, vodafoneMethodIds) => {
 // transactionId is the canonical customer-facing deposit reference. The
 // legacy field and explicitly labelled notes are read only for old deposits.
 const extractDepositTransactionId = (deposit) => {
+    // A phone+receipt submission has no verified transaction reference to match.
+    if (deposit.senderDetails?.field === 'senderPhoneNumber' && !deposit.transactionId) return null;
     if (deposit.transactionId) return String(deposit.transactionId).trim();
     if (deposit.paymentTransactionId) return String(deposit.paymentTransactionId).trim();
     const noteMatch = String(deposit.notes || '').match(/(?:transaction\s*(?:id|number)|رقم\s*العملية|رقم\s*التحويل)\s*[:：#-]?\s*([0-9]{8,20})/iu);
@@ -208,6 +210,9 @@ const matchPaymentEvent = async (eventId) => {
     } else {
         const phoneCompatible = amountCandidates.filter((deposit) => {
             const depositPhone = getDepositSenderPhone(deposit);
+            if (deposit.senderDetails?.field === 'senderPhoneNumber') {
+                return Boolean(depositPhone) && depositPhone === event.senderPhone;
+            }
             return !depositPhone || depositPhone === event.senderPhone;
         });
         if (amountCandidates.length && !phoneCompatible.length) {

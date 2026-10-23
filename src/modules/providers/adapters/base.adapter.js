@@ -181,10 +181,8 @@ class BaseProviderAdapter {
      * @returns {string|null}
      */
     _resolveToken() {
-        return this.provider.apiToken
-            || this.provider.apiKey
-            || this.provider.effectiveToken
-            || null;
+        return [this.provider.apiToken, this.provider.apiKey, this.provider.effectiveToken]
+            .find((value) => typeof value === 'string' && value.trim())?.trim() || null;
     }
 
     /**
