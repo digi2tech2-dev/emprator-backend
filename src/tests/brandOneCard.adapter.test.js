@@ -27,6 +27,7 @@ const order = { externalProductId: '365', quantity: 2, referenceId: 'ORDER-123',
 test('configures the documented host, token and timeout', () => {
     expect(axios.create).toHaveBeenCalledWith({
         baseURL: provider.baseUrl, timeout: 180000,
+        transformResponse: [expect.any(Function)],
         headers: { 'api-token': provider.apiToken, Accept: 'application/json' },
     });
     new BrandOneCardAdapter({ apiKey: 'legacy-token' }, { timeoutMs: 123 });

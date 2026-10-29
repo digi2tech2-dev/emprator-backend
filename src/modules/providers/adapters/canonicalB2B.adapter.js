@@ -3,6 +3,7 @@
 // Adapter for another deployment's complete canonical base URL, e.g.
 // https://provider.example/client/api. It never appends a path to baseUrl.
 const axios = require('axios');
+const { parseProviderJson } = require('./providerJson.helper');
 const { BaseProviderAdapter } = require('./base.adapter');
 
 const DEFAULT_TIMEOUT_MS = 180_000;
@@ -52,6 +53,7 @@ class CanonicalB2BAdapter extends BaseProviderAdapter {
         if (!token) throw new Error('[CanonicalB2B] api token (apiToken / apiKey) is required');
 
         this._client = options.httpClient || axios.create({
+            transformResponse: [parseProviderJson],
             baseURL,
             timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
             headers: { 'api-token': token, 'Content-Type': 'application/json', Accept: 'application/json' },

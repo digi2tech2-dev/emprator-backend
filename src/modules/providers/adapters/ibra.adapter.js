@@ -15,6 +15,7 @@
  */
 
 const axios = require('axios');
+const { parseProviderJson } = require('./providerJson.helper');
 const crypto = require('crypto');
 const { BaseProviderAdapter } = require('./base.adapter');
 
@@ -103,6 +104,7 @@ const normalizeStatus = (status) => {
 
 const buildClient = (baseURL, token, timeoutMs = DEFAULT_TIMEOUT_MS) => {
     const client = axios.create({
+        transformResponse: [parseProviderJson],
         baseURL,
         timeout: timeoutMs,
         headers: {

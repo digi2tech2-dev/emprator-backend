@@ -1,6 +1,7 @@
 'use strict';
 
 const axios = require('axios');
+const { parseProviderJson } = require('./providerJson.helper');
 const { BaseProviderAdapter } = require('./base.adapter');
 const { extractTargetId } = require('./providerParams.helper');
 const { normalizeProviderDecimalPrice } = require('../../../shared/utils/decimalPrecision');
@@ -137,6 +138,7 @@ class DealerApiError extends Error {
 
 const buildClient = (baseURL, timeoutMs = DEFAULT_TIMEOUT_MS) => {
     const client = axios.create({
+        transformResponse: [parseProviderJson],
         baseURL,
         timeout: timeoutMs,
         headers: {

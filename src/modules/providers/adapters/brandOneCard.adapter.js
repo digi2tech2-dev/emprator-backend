@@ -1,9 +1,20 @@
 'use strict';
 
 const axios = require('axios');
+const { parseProviderJson } = require('./providerJson.helper');
 const { BaseProviderAdapter } = require('./base.adapter');
 const { getConversionRate } = require('../../../services/currencyConverter.service');
-const { Decimal, divide } = require('../../../shared/utils/decimalPrecision');
+const { Decimal } = require('../../../shared/utils/decimalPrecision');
+
+// Currency conversion must not reuse the calculated-price helper's 50 dp cap.
+// Allow all input digits plus guard digits for division; repeating fractions
+// necessarily have a finite representation, but terminating prices stay exact.
+const convertSupplierPrice = (price, rate) => {
+    const ConversionDecimal = Decimal.clone({
+        precision: Math.max(60, new Decimal(price).sd() + new Decimal(rate).sd() + 100),
+    });
+    return new ConversionDecimal(price).dividedBy(rate).toFixed();
+};
 
 // Brand One Card is independent of the existing brand1-card provider.
 const DEFAULT_BASE_URL = 'https://api.brand-one-card.com';
@@ -36,6 +47,7 @@ class BrandOneCardAdapter extends BaseProviderAdapter {
         const token = this._resolveToken();
         if (!token) throw new Error('[BrandOneCard] api token (apiToken / apiKey) is required');
         this._client = options.httpClient || axios.create({
+            transformResponse: [parseProviderJson],
             baseURL: (provider.baseUrl || DEFAULT_BASE_URL).replace(/\/+$/, ''),
             timeout: options.timeoutMs ?? 180_000,
             headers: { 'api-token': token, Accept: 'application/json' },
@@ -78,7 +90,7 @@ class BrandOneCardAdapter extends BaseProviderAdapter {
             return this._validateDTO({
                 externalProductId: String(item.id),
                 rawName: item.name,
-                rawPrice: currency === 'USD' ? dto.rawPrice : divide(dto.rawPrice, rate),
+                rawPrice: currency === 'USD' ? dto.rawPrice : convertSupplierPrice(dto.rawPrice, rate),
                 minQty: item.qty_values == null ? 1 : Number(item.qty_values.min),
                 maxQty: item.qty_values == null ? 1 : Number(item.qty_values.max),
                 isActive: item.available !== false,

@@ -8,7 +8,8 @@
  * ALL product prices (basePrice, providerPrice, finalPrice, rawPrice,
  * manualPriceAdjustment) are stored as **String** in MongoDB and flow
  * through the backend as strings. This module wraps `decimal.js` so
- * that every calculation preserves up to 50 decimal places.
+ * that every calculation preserves up to 50 decimal places. Supplier price
+ * normalization preserves the full input without this calculation limit.
  *
  * Wallet-facing amounts (chargedAmount, walletDeducted) are still
  * standard 2 dp Numbers because fiat currency doesn't need 50 dp.
@@ -64,7 +65,9 @@ const normalizeProviderDecimalPrice = (value) => {
         if (raw === null || raw === undefined || raw === '') return '0';
         const decimal = new Decimal(raw);
         if (!decimal.isFinite() || decimal.isNegative()) return '0';
-        return toStr(decimal);
+        // Supplier input is data, not a calculated amount: never cap its scale.
+        // Decimal construction and toFixed() without dp do not round the input.
+        return decimal.toFixed();
     } catch {
         return '0';
     }

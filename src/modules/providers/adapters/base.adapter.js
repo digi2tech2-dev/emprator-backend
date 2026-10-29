@@ -1,5 +1,7 @@
 'use strict';
 
+const { Decimal } = require('../../../shared/utils/decimalPrecision');
+
 /**
  * BaseProviderAdapter
  *
@@ -160,7 +162,9 @@ class BaseProviderAdapter {
     _validateDTO(dto) {
         if (!dto.externalProductId) throw new Error('DTO missing externalProductId');
         if (!dto.rawName) throw new Error('DTO missing rawName');
-        if (dto.rawPrice == null || isNaN(Number(dto.rawPrice)) || Number(dto.rawPrice) < 0) {
+        let price;
+        try { price = new Decimal(dto.rawPrice); } catch { /* rejected below */ }
+        if (!price || !price.isFinite() || price.isNegative()) {
             throw new Error(`DTO rawPrice must be a non-negative number, got: ${dto.rawPrice}`);
         }
         return {
