@@ -2,6 +2,8 @@
 
 const axios = require('axios');
 const { BaseProviderAdapter } = require('./base.adapter');
+const { getConversionRate } = require('../../../services/currencyConverter.service');
+const { Decimal, divide } = require('../../../shared/utils/decimalPrecision');
 
 // Brand One Card is independent of the existing brand1-card provider.
 const DEFAULT_BASE_URL = 'https://api.brand-one-card.com';
@@ -52,22 +54,37 @@ class BrandOneCardAdapter extends BaseProviderAdapter {
         const { data } = await this._client.get('/client/api/products');
         this._assertSuccess(data);
         if (!Array.isArray(data)) throw new Error('[BrandOneCard] Invalid product list');
-        return data.map((item) => {
+        // Products are priced in the supplier account currency, while the
+        // platform stores provider prices in USD. Resolve each rate once per fetch.
+        const rates = new Map();
+        let accountCurrency;
+        if (data.some((item) => !String(item.currency ?? '').trim())) {
+            const profile = await this.getBalance();
+            accountCurrency = profile?.currency;
+        }
+        return Promise.all(data.map(async (item) => {
             if (item.id == null) throw new Error('[BrandOneCard] Product is missing its ID');
-            // The platform's provider price pipeline stores USD prices.
-            if (item.currency && String(item.currency).trim().toUpperCase() !== 'USD') {
-                throw new Error(`[BrandOneCard] Product ${item.id} currency must be USD for the provider price pipeline`);
+            const currency = (String(item.currency ?? '').trim() || String(accountCurrency ?? '').trim()).toUpperCase();
+            if (!currency) throw new Error('[BrandOneCard] Missing product/account currency');
+            if (!rates.has(currency)) rates.set(currency, getConversionRate(currency));
+            const rate = await rates.get(currency);
+            if (!new Decimal(rate).isFinite() || !new Decimal(rate).greaterThan(0)) {
+                throw new Error(`[BrandOneCard] Invalid conversion rate for ${currency}`);
             }
+            // Validate the original price before division (which tolerates bad inputs).
+            const dto = this._validateDTO({
+                externalProductId: String(item.id), rawName: item.name, rawPrice: item.price,
+            });
             return this._validateDTO({
                 externalProductId: String(item.id),
                 rawName: item.name,
-                rawPrice: item.price,
+                rawPrice: currency === 'USD' ? dto.rawPrice : divide(dto.rawPrice, rate),
                 minQty: item.qty_values == null ? 1 : Number(item.qty_values.min),
                 maxQty: item.qty_values == null ? 1 : Number(item.qty_values.max),
                 isActive: item.available !== false,
                 rawPayload: item,
             });
-        });
+        }));
     }
 
     async getContent(categoryId = 0) {

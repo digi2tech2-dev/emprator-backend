@@ -18,7 +18,14 @@ Create a provider with these settings (replace the token):
 The factory also resolves slug `brand-one-card` and names `brand one card`
 or `brandonecard`. No production provider record is created by this code change.
 
-Use a USD provider account: the platform's provider price pipeline expects USD.
+Provider accounts can use USD, EGP or another active platform currency. Product
+prices are converted to internal USD using the currency's configured
+`platformRate` (local units per USD). For example, 50 EGP at a rate of 50
+is imported as 1 USD. Configure and activate EGP in the platform before syncing.
+Missing, inactive or invalid currency rates cause an explicit sync error rather
+than importing incorrectly priced products. If a product omits currency, the
+adapter reads it from the account profile. Original supplier prices and currency
+remain in `rawPayload`; balance continues to use the supplier account currency.
 Product `params`, `params_info`, `product_type`, currency and other metadata are
 preserved in `rawPayload`. Map customer fields to the exact API keys in `params`
 (for example `playerId` or `serverId`) through the existing provider mapping.

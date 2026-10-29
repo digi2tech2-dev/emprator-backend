@@ -1,7 +1,9 @@
 'use strict';
 
 jest.mock('axios');
+jest.mock('../services/currencyConverter.service', () => ({ getConversionRate: jest.fn() }));
 const axios = require('axios');
+const { getConversionRate } = require('../services/currencyConverter.service');
 const { BrandOneCardAdapter } = require('../modules/providers/adapters/brandOneCard.adapter');
 const { AlkasrVipAdapter } = require('../modules/providers/adapters/alkasr.adapter');
 const { getAdapter, getProviderAdapter } = require('../modules/providers/adapters/adapter.factory');
@@ -10,6 +12,8 @@ const provider = { slug: 'brand-one-card', baseUrl: 'https://api.brand-one-card.
 let client;
 let adapter;
 beforeEach(() => {
+    getConversionRate.mockReset();
+    getConversionRate.mockImplementation(async (currency) => currency === 'USD' ? 1 : 50);
     client = { get: jest.fn(), interceptors: { response: { use: jest.fn() } } };
     axios.create.mockReturnValue(client);
     adapter = new BrandOneCardAdapter(provider);
@@ -60,9 +64,41 @@ test('maps availability, quantity limits, prices and preserves product metadata'
     expect(client.get).toHaveBeenCalledWith('/client/api/products');
 });
 
-test('rejects unsupported currency instead of importing a wrong USD price', async () => {
-    client.get.mockResolvedValue({ data: [{ id: 1, name: 'Item', price: 5, currency: 'EGP' }] });
-    await expect(adapter.getProducts()).rejects.toThrow('currency must be USD');
+test('imports EGP products as USD while preserving supplier prices and currency', async () => {
+    const item = { id: 1, name: 'Item', price: '50.125', currency: 'EGP', qty_values: null };
+    client.get.mockResolvedValue({ data: [item, { ...item, id: 2, price: '0.00000001', currency: ' egp ' }] });
+    const products = await adapter.getProducts();
+    expect(products[0]).toMatchObject({ rawPrice: '1.0025', rawPayload: item });
+    expect(products[1].rawPrice).toBe('0.0000000002');
+    expect(getConversionRate).toHaveBeenCalledTimes(1);
+    expect(getConversionRate).toHaveBeenCalledWith('EGP');
+    // The existing checkout conversion recovers the original EGP cost.
+    expect(Number(products[0].rawPrice) * 50).toBe(50.125);
+});
+
+test('uses account currency when products omit it', async () => {
+    client.get.mockResolvedValueOnce({ data: [{ id: 1, name: 'Item', price: 100 }] })
+        .mockResolvedValueOnce({ data: { currency: 'EGP', balance: '500' } });
+    expect((await adapter.getProducts())[0].rawPrice).toBe('2');
+    expect(client.get).toHaveBeenLastCalledWith('/client/api/profile');
+});
+
+test('fails clearly when the account currency is also missing', async () => {
+    client.get.mockResolvedValueOnce({ data: [{ id: 1, name: 'Item', price: 100 }] })
+        .mockResolvedValueOnce({ data: { balance: '500' } });
+    await expect(adapter.getProducts()).rejects.toThrow('Missing product/account currency');
+});
+
+test.each([0, -50, Infinity, NaN])('does not import prices with invalid rate %s', async (rate) => {
+    getConversionRate.mockResolvedValue(rate);
+    client.get.mockResolvedValue({ data: [{ id: 1, name: 'Item', price: 50, currency: 'EGP' }] });
+    await expect(adapter.getProducts()).rejects.toThrow('Invalid conversion rate');
+});
+
+test('propagates missing or inactive currency configuration errors', async () => {
+    getConversionRate.mockRejectedValue(new Error("Currency 'EGP' is currently inactive."));
+    client.get.mockResolvedValue({ data: [{ id: 1, name: 'Item', price: 50, currency: 'EGP' }] });
+    await expect(adapter.getProducts()).rejects.toThrow("Currency 'EGP' is currently inactive.");
 });
 
 test('places GET orders with dynamic query keys and a stable idempotency reference', async () => {
