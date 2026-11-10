@@ -558,7 +558,9 @@ const _attemptCreateOrder = async (
         }
 
         // ── 1. Load & Validate Product ─────────────────────────────────────────
-        const product = await Product.findById(productId).session(session);
+        const product = await Product.findById(productId)
+            .populate('provider', 'adapterType slug')
+            .session(session);
         if (!product) throw new NotFoundError('Product');
         if (!product.isActive) {
             throw new BusinessRuleError('This product is currently unavailable.', 'PRODUCT_INACTIVE');
@@ -834,7 +836,14 @@ const _attemptCreateOrder = async (
         // ── END Quantity-Only Branch ─────────────────────────────────────────
 
         // ── 3. Pricing Engine (USD) ────────────────────────────────────────────
-        const pricing = await calculateUserPrice(userId, product.basePrice, session);
+        const isCanonicalB2B = String(product.provider?.adapterType || '').toLowerCase() === 'canonical-b2b'
+            || String(product.provider?.slug || '').toLowerCase() === 'canonical-b2b';
+        const pricingBase = isCanonicalB2B && product.providerPrice != null
+            ? (compare(String(product.providerPrice), String(product.basePrice)) > 0
+                ? String(product.providerPrice)
+                : String(product.basePrice))
+            : product.basePrice;
+        const pricing = await calculateUserPrice(userId, pricingBase, session);
         const usdTotalPrice = multiply(pricing.finalPrice, String(qty));
 
         // ── 3a. Profit Calculation (USD) ────────────────────────────────────────

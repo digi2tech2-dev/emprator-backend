@@ -6,6 +6,7 @@ const { Category } = require('../categories/category.model');
 const { Order } = require('../orders/order.model');
 const orderService = require('../orders/order.service');
 const { calculateFinalPrice } = require('../orders/pricing.service');
+const { compare } = require('../../shared/utils/decimalPrecision');
 const { getNextSequence } = require('../orders/counter.model');
 const { ClientCompatError, ERROR_CODES } = require('./clientCompat.errors');
 const {
@@ -34,6 +35,8 @@ const PRODUCT_SELECT = [
     'minQty',
     'maxQty',
     'basePrice',
+    'providerPrice',
+    'provider',
     'orderFields',
     'dynamicFields',
     'displayOrder',
@@ -150,7 +153,16 @@ const buildCategoryMaps = (categories) => {
 
 const priceProduct = async (product, reseller) => {
     const percentage = Number(reseller.groupId?.percentage || 0);
-    const priceUsd = calculateFinalPrice(product.basePrice, percentage);
+    // Canonical B2B suppliers reject orders below their live cost.  A stale
+    // published basePrice must therefore never make this catalog cheaper than
+    // the last synced provider cost.  Keep this guard scoped to canonical B2B
+    // so pricing for every other provider remains unchanged.
+    const isCanonicalB2B = String(product.provider?.adapterType || '').toLowerCase() === 'canonical-b2b'
+        || String(product.provider?.slug || '').toLowerCase() === 'canonical-b2b';
+    const pricingBase = isCanonicalB2B && product.providerPrice != null
+        ? (compare(String(product.providerPrice), String(product.basePrice)) > 0 ? product.providerPrice : product.basePrice)
+        : product.basePrice;
+    const priceUsd = calculateFinalPrice(pricingBase, percentage);
 
     return {
         priceUsd,
@@ -175,6 +187,7 @@ const listProducts = async (reseller, { productsId = '', base = false } = {}) =>
     const [products, categories] = await Promise.all([
         Product.find(filter)
             .select(PRODUCT_SELECT)
+            .populate('provider', 'adapterType slug')
             .sort({ displayOrder: 1, name: 1 })
             .lean(),
         loadCategories(),
@@ -217,6 +230,7 @@ const getContent = async (reseller, parentId) => {
     const [allProducts, categories] = await Promise.all([
         Product.find({ isActive: true, deletedAt: null })
             .select(PRODUCT_SELECT)
+            .populate('provider', 'adapterType slug')
             .sort({ displayOrder: 1, name: 1 })
             .lean(),
         loadCategories(),
